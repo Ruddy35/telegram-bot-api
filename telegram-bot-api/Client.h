@@ -53,14 +53,23 @@ class Client final : public WebhookActor::Callback {
 
   void send(PromisedQueryPtr query) final;
 
+  // sends a query, which was delayed during a restart, skipping flood checks
+  void send_delayed(PromisedQueryPtr query);
+
   void close();
 
-  // Gracefully closes the TDLib instance to release all memory used by it. The Client waits until all active requests
-  // are answered and all received updates are handled, then closes the TDLib instance and stops itself without failing
-  // any request. The caller must not send new queries to the Client after the call and must create a new Client for
-  // the bot after the Client is stopped. The promise is resolved right before the TDLib instance is closed, or fails if
-  // the restart can't be done now; in the latter case the Client continues to work as usual.
+  // Graceful restart of the TDLib instance to release all memory used by it. It is done in two phases.
+  // 1. restart: the caller must stop sending getUpdates queries to the Client; the Client pauses the webhook and waits
+  //    until there are no active requests and no updates being sent to the webhook. The promise is resolved when the
+  //    phase is finished.
+  // 2. continue_restart: the caller must stop sending any queries to the Client; the Client waits until all active
+  //    requests are answered and all received updates are handled, then closes the TDLib instance and stops itself
+  //    without failing any request. The promise is resolved right before the TDLib instance is closed. The caller
+  //    must create a new Client for the bot after the Client is stopped.
+  // If any of the promises fails, then the restart is cancelled and the Client continues to work as usual.
   void restart(double max_drain_time, td::Promise<td::Unit> promise);
+
+  void continue_restart(td::Promise<td::Unit> promise);
 
   // for stats
   ServerBotInfo get_bot_info() const;
@@ -521,7 +530,11 @@ class Client final : public WebhookActor::Callback {
 
   void clear_tqueue();
 
+  void do_send(PromisedQueryPtr query, bool check_flood_limits);
+
   bool is_restart_in_progress() const;
+
+  bool is_ready_for_restart_drain() const;
 
   bool is_ready_for_restart() const;
 
@@ -529,7 +542,7 @@ class Client final : public WebhookActor::Callback {
 
   void on_restart_network_disabled(td::uint64 restart_generation, bool is_ok);
 
-  void on_webhook_paused(td::uint64 restart_generation);
+  void on_webhook_paused(td::uint64 restart_generation, td::uint64 webhook_generation, bool is_ok);
 
   void cancel_restart(td::Slice reason);
 
@@ -1620,10 +1633,12 @@ class Client final : public WebhookActor::Callback {
   bool clear_tqueue_ = false;
 
   // graceful restart of the TDLib instance
-  enum class RestartState : td::int8 { None, Draining, GoingOffline, Offline, Closing };
+  enum class RestartState : td::int8 { None, Pausing, Paused, Draining, GoingOffline, Offline, Closing };
   RestartState restart_state_ = RestartState::None;
   td::Promise<td::Unit> restart_promise_;
   td::uint64 restart_generation_ = 0;
+  td::uint64 restart_webhook_generation_ = 0;
+  double restart_max_drain_time_ = 0.0;
   double restart_deadline_ = 0.0;
   double restart_offline_check_time_ = 0.0;
   bool is_webhook_paused_ = false;

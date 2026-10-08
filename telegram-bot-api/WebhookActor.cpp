@@ -332,7 +332,7 @@ void WebhookActor::loop() {
   if (!stop_flag_) {
     resolve_ip_address();
   }
-  if (!stop_flag_ && !is_paused_) {
+  if (!stop_flag_) {
     create_new_connections();
   }
   if (!stop_flag_ && !is_paused_) {

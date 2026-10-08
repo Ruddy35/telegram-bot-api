@@ -8518,6 +8518,9 @@ class Client::TdOnSendCustomRequestCallback final : public TdQueryCallback {
 };
 
 void Client::close() {
+  if (is_restart_in_progress()) {
+    cancel_restart("closing");
+  }
   need_close_ = true;
   if (td_client_.empty()) {
     set_timeout_in(0);
@@ -8533,32 +8536,52 @@ void Client::restart(double max_drain_time, td::Promise<td::Unit> promise) {
   if (td_client_.empty() || !was_authorized_ || closing_ || logging_out_ || need_close_) {
     return promise.set_error(td::Status::Error(400, "The bot isn't ready for restart"));
   }
+  if (webhook_set_query_ || active_webhook_set_query_) {
+    return promise.set_error(td::Status::Error(400, "The webhook is being changed"));
+  }
 
   LOG(WARNING) << "Start graceful restart of TDLib instance after " << tdlib_update_count_ << " updates received in "
                << (td::Time::now() - start_time_) << " seconds";
-  restart_state_ = RestartState::Draining;
+  restart_state_ = RestartState::Pausing;
   restart_promise_ = std::move(promise);
   restart_generation_++;
+  restart_webhook_generation_ = webhook_generation_;
+  restart_max_drain_time_ = max_drain_time;
   restart_deadline_ = td::Time::now() + max_drain_time;
   is_webhook_paused_ = false;
 
   if (!webhook_id_.empty()) {
-    // don't start sending of new updates to avoid their duplication after restart
+    // stop sending of new updates; the updates being sent must be answered by the bot before the restart, because
+    // otherwise they would be sent again after the restart
     send_closure(webhook_id_, &WebhookActor::pause,
-                 td::PromiseCreator::lambda(
-                     [actor_id = actor_id(this), restart_generation = restart_generation_](td::Result<td::Unit>) {
-                       send_closure(actor_id, &Client::on_webhook_paused, restart_generation);
-                     }));
+                 td::PromiseCreator::lambda([actor_id = actor_id(this), restart_generation = restart_generation_,
+                                             webhook_generation = webhook_generation_](td::Result<td::Unit> result) {
+                   send_closure(actor_id, &Client::on_webhook_paused, restart_generation, webhook_generation,
+                                result.is_ok());
+                 }));
   }
 
-  // answer the active getUpdates request immediately; new requests are kept by the ClientManager till the restart end
-  long_poll_wakeup(true);
+  check_restart();
+}
 
+void Client::continue_restart(td::Promise<td::Unit> promise) {
+  if (restart_state_ != RestartState::Paused) {
+    return promise.set_error(td::Status::Error(400, "Restart was cancelled"));
+  }
+  restart_state_ = RestartState::Draining;
+  restart_promise_ = std::move(promise);
+  restart_deadline_ = td::Time::now() + restart_max_drain_time_;
   check_restart();
 }
 
 bool Client::is_restart_in_progress() const {
   return restart_state_ != RestartState::None && restart_state_ != RestartState::Closing;
+}
+
+bool Client::is_ready_for_restart_drain() const {
+  // there must be no active requests and no updates being sent to the webhook
+  return !long_poll_query_ && !webhook_set_query_ && !active_webhook_set_query_ &&
+         (webhook_id_.empty() || is_webhook_paused_) && stat_actor_.get_actor_unsafe()->get_active_request_count() == 0;
 }
 
 bool Client::is_ready_for_restart() const {
@@ -8579,11 +8602,41 @@ bool Client::is_ready_for_restart() const {
 }
 
 void Client::check_restart() {
+  if (!is_restart_in_progress()) {
+    return;
+  }
+  if (webhook_generation_ != restart_webhook_generation_) {
+    return cancel_restart("the webhook was changed");
+  }
+
   auto now = td::Time::now();
   switch (restart_state_) {
+    case RestartState::Pausing:
+      if (now >= restart_deadline_) {
+        return cancel_restart("active requests weren't finished in time");
+      }
+      if (long_poll_query_) {
+        // answer the getUpdates request immediately; new requests are kept by the ClientManager till the restart end
+        long_poll_wakeup(true);
+      }
+      if (!is_ready_for_restart_drain()) {
+        return set_timeout_in(RESTART_CHECK_INTERVAL);
+      }
+
+      LOG(INFO) << "Ready to delay requests for restart";
+      restart_state_ = RestartState::Paused;
+      cancel_timeout();
+      restart_promise_.set_value(td::Unit());
+      return;
+    case RestartState::Paused:
+      // wait for continue_restart
+      return;
     case RestartState::Draining:
       if (now >= restart_deadline_) {
         return cancel_restart("active requests weren't finished in time");
+      }
+      if (long_poll_query_) {
+        long_poll_wakeup(true);
       }
       if (!is_ready_for_restart()) {
         return set_timeout_in(RESTART_CHECK_INTERVAL);
@@ -8625,7 +8678,6 @@ void Client::check_restart() {
       return do_send_request(make_object<td_api::close>(), td::make_unique<TdOnOkCallback>());
     case RestartState::None:
     case RestartState::Closing:
-      return;
     default:
       UNREACHABLE();
   }
@@ -8646,8 +8698,10 @@ void Client::on_restart_network_disabled(td::uint64 restart_generation, bool is_
   set_timeout_at(restart_offline_check_time_);
 }
 
-void Client::on_webhook_paused(td::uint64 restart_generation) {
-  if (restart_generation != restart_generation_ || !is_restart_in_progress()) {
+void Client::on_webhook_paused(td::uint64 restart_generation, td::uint64 webhook_generation, bool is_ok) {
+  // if the WebhookActor was closed, then wait for webhook_closed instead
+  if (!is_ok || restart_generation != restart_generation_ || webhook_generation != webhook_generation_ ||
+      !is_restart_in_progress()) {
     return;
   }
   LOG(INFO) << "Webhook was paused before restart";
@@ -8802,9 +8856,17 @@ void Client::start_up() {
 }
 
 void Client::send(PromisedQueryPtr query) {
+  do_send(std::move(query), true);
+}
+
+void Client::send_delayed(PromisedQueryPtr query) {
+  do_send(std::move(query), false);
+}
+
+void Client::do_send(PromisedQueryPtr query, bool check_flood_limits) {
   if (!query->is_internal()) {
     query->set_stat_actor(stat_actor_);
-    if (!parameters_->local_mode_ && !is_local_method(query->method()) &&
+    if (check_flood_limits && !parameters_->local_mode_ && !is_local_method(query->method()) &&
         td::Time::now() > parameters_->start_time_ + 60) {
       BotStatActor *stat = stat_actor_.get_actor_unsafe();
       auto update_per_minute = static_cast<int64>(stat->get_minute_update_count(td::Time::now()) * 60);

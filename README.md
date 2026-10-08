@@ -99,15 +99,17 @@ and continue sending requests to the new server as usual.
 
 Each bot is served by a separate TDLib instance, which keeps all users, chats and files the bot has ever seen in memory,
 so memory usage of the server grows with time. The server can gracefully restart the TDLib instance of a bot without
-restarting the process: new requests of the bot are delayed, active requests are finished, all received updates are
-handled, then the TDLib instance is closed and reopened from the same database, and the delayed requests are processed.
-No request fails, no update is lost or sent twice, and other bots aren't affected.
+restarting the process: receiving of new updates is paused until the bot has no active requests, then new requests of
+the bot are delayed, all received updates are handled, the TDLib instance is closed and reopened from the same database,
+and the delayed requests are processed. No request fails, no update is lost or sent twice, and other bots aren't
+affected.
 
 * `--tdlib-restart-memory-limit=<megabytes>` - restart TDLib instances of the most active bots one by one while memory
   usage of the server exceeds the limit; see also `--tdlib-restart-min-uptime`.
 * `--tdlib-restart-interval=<seconds>` - restart TDLib instance of each bot after the specified uptime.
 * `--tdlib-restart-drain-timeout=<seconds>` - maximum time to wait for active requests of a bot; the restart is postponed
   if the time is exceeded.
+* `--malloc-trim` - return free memory to the OS after restarts; useful only with glibc memory allocator.
 * `--message-unload-delay=<seconds>` - delay after which unused messages are unloaded from TDLib memory.
 * `GET http://<stat address>:<stat port>/?restart=<bot_id>|all` - request a restart manually.
 

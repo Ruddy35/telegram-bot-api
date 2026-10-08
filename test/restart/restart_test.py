@@ -43,14 +43,20 @@ def log(*args, **kwargs):
 class Hook(BaseHTTPRequestHandler):
     delay = 0.0
     received = collections.Counter()
+    api_errors = []
     lock = threading.Lock()
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get('Content-Length', 0)))
         update = json.loads(body)
+        # like many bot frameworks, call API methods after processing of the update, but before the webhook request is
+        # answered
         time.sleep(Hook.delay)
+        result, _ = api('getWebhookInfo')
         with Hook.lock:
             Hook.received[update['update_id']] += 1
+            if not result.get('ok'):
+                Hook.api_errors.append(result)
         self.send_response(200)
         self.send_header('Content-Length', '0')
         self.end_headers()
@@ -163,7 +169,8 @@ def restart_count():
 
 
 def scenario_webhook():
-    """Restarts while webhook updates are being delivered: no duplicates, no losses, no failed requests."""
+    """Restarts while webhook updates are being delivered and the webhook handler calls API methods before answering:
+    no duplicates, no losses, no failed requests."""
     update_count = 300
     work = prepare('webhook', update_count)
     Hook.delay = 0.3
@@ -187,6 +194,8 @@ def scenario_webhook():
         wait_for(lambda: len(Hook.received) >= update_count, 120, 'all updates')
         time.sleep(2)
         load.finish()
+        assert not Hook.api_errors, Hook.api_errors[:5]
+        assert stats()['tdlib_failed_restart_count'] == '0', 'restart was cancelled'
         duplicates = {k: v for k, v in Hook.received.items() if v != 1}
         log('delivered %d unique updates, duplicates: %s' % (len(Hook.received), duplicates))
         assert not duplicates, duplicates

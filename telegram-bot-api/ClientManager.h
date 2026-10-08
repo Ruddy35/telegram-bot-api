@@ -76,7 +76,8 @@ class ClientManager final : public td::Actor {
     double start_time_ = 0.0;        // creation time of the current Client
 
     // graceful restart of the TDLib instance
-    enum class RestartState : td::int8 { None, Draining, Closing };
+    // Pausing: getUpdates queries are delayed; Draining and Closing: all queries are delayed
+    enum class RestartState : td::int8 { None, Pausing, Draining, Closing };
     RestartState restart_state_ = RestartState::None;
     std::queue<PromisedQueryPtr> restart_queries_;  // queries received during the restart
     double restart_start_time_ = 0.0;
@@ -107,6 +108,7 @@ class ClientManager final : public td::Actor {
   td::int64 last_tqueue_deleted_events_ = 0;
 
   td::uint64 restarting_client_id_ = 0;
+  bool has_restart_requests_ = false;
   double next_restart_time_ = 0.0;
   double next_memory_check_time_ = 0.0;
   double malloc_trim_time_ = 0.0;
@@ -146,7 +148,11 @@ class ClientManager final : public td::Actor {
 
   void start_restart(td::uint64 id, td::Slice reason);
 
+  void on_restart_paused(td::uint64 id, td::Result<td::Unit> result);
+
   void on_restart_closing(td::uint64 id, td::Result<td::Unit> result);
+
+  void cancel_restart(ClientInfo *client_info, td::uint64 id, const td::Status &error);
 
   void finish_restart(td::uint64 id);
 

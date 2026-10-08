@@ -277,6 +277,10 @@ int main(int argc, char *argv[]) {
                   "exceeded (default is "
                << tdlib_restart_drain_timeout << ")",
       td::OptionParser::parse_integer(tdlib_restart_drain_timeout));
+  options.add_option('\0', "malloc-trim",
+                     "return free memory to the OS using malloc_trim after each restart of a TDLib instance; useful "
+                     "only with glibc memory allocator",
+                     [&] { parameters->malloc_trim_ = true; });
   options.add_checked_option('\0', "tdlib-restart-cooldown",
                              PSLICE() << "minimum delay in seconds between automatic restarts of TDLib instances "
                                          "(default is "

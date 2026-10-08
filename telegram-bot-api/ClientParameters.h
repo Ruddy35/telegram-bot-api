@@ -127,6 +127,7 @@ struct ClientParameters {
   double tdlib_restart_min_uptime_ = 3600.0;   // minimum TDLib instance uptime for a restart due to the memory limit
   double tdlib_restart_drain_timeout_ = 30.0;  // maximum time to wait for active requests before a restart
   double tdlib_restart_cooldown_ = 10.0;       // minimum time between automatic restarts
+  bool malloc_trim_ = false;                   // call malloc_trim after restarts
 
   double start_time_ = 0;
 
