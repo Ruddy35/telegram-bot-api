@@ -188,6 +188,11 @@ int main(int argc, char *argv[]) {
   td::string username;
   td::string groupname;
   td::uint64 max_connections = 0;
+  td::int32 tdlib_restart_interval = 0;
+  td::int64 tdlib_restart_memory_limit = 0;
+  td::int32 tdlib_restart_min_uptime = static_cast<td::int32>(parameters->tdlib_restart_min_uptime_);
+  td::int32 tdlib_restart_drain_timeout = static_cast<td::int32>(parameters->tdlib_restart_drain_timeout_);
+  td::int32 tdlib_restart_cooldown = static_cast<td::int32>(parameters->tdlib_restart_cooldown_);
   td::uint64 cpu_affinity = 0;
   td::uint64 main_thread_affinity = 0;
   ClientManager::TokenRange token_range{0, 1};
@@ -246,6 +251,37 @@ int main(int argc, char *argv[]) {
   options.add_checked_option('\0', "max-webhook-connections",
                              "default value of the maximum webhook connections per bot",
                              td::OptionParser::parse_integer(parameters->default_max_webhook_connections_));
+  options.add_checked_option(
+      '\0', "message-unload-delay",
+      "delay in seconds after which messages are unloaded from TDLib memory if they aren't used; "
+      "must be between 60 and 86400 (defaults to the TDLib default of 1800 for bots)",
+      td::OptionParser::parse_integer(parameters->message_unload_delay_));
+  options.add_checked_option('\0', "tdlib-restart-interval",
+                             "gracefully restart TDLib instance of each bot after the specified number of seconds of "
+                             "its work to release all memory used by it; requests aren't failed during a restart, they "
+                             "are delayed for a few seconds instead (disabled by default)",
+                             td::OptionParser::parse_integer(tdlib_restart_interval));
+  options.add_checked_option('\0', "tdlib-restart-memory-limit",
+                             "gracefully restart TDLib instances of the most active bots one by one while memory usage "
+                             "of the server exceeds the specified number of megabytes (disabled by default)",
+                             td::OptionParser::parse_integer(tdlib_restart_memory_limit));
+  options.add_checked_option('\0', "tdlib-restart-min-uptime",
+                             PSLICE() << "minimum uptime in seconds of a TDLib instance before it can be restarted "
+                                         "because of the memory limit (default is "
+                                      << tdlib_restart_min_uptime << ")",
+                             td::OptionParser::parse_integer(tdlib_restart_min_uptime));
+  options.add_checked_option(
+      '\0', "tdlib-restart-drain-timeout",
+      PSLICE() << "maximum time in seconds to wait for completion of active requests of a bot "
+                  "before restart of its TDLib instance; the restart is postponed if the time is "
+                  "exceeded (default is "
+               << tdlib_restart_drain_timeout << ")",
+      td::OptionParser::parse_integer(tdlib_restart_drain_timeout));
+  options.add_checked_option('\0', "tdlib-restart-cooldown",
+                             PSLICE() << "minimum delay in seconds between automatic restarts of TDLib instances "
+                                         "(default is "
+                                      << tdlib_restart_cooldown << ")",
+                             td::OptionParser::parse_integer(tdlib_restart_cooldown));
   options.add_checked_option('\0', "http-ip-address",
                              "local IP address, HTTP connections to which will be accepted. By default, connections to "
                              "any local IPv4 address are accepted",
@@ -304,6 +340,23 @@ int main(int argc, char *argv[]) {
   options.add_check([&] {
     if (parameters->api_id_ <= 0 || parameters->api_hash_.empty()) {
       return td::Status::Error("You must provide valid api-id and api-hash obtained at https://my.telegram.org");
+    }
+    return td::Status::OK();
+  });
+  options.add_check([&] {
+    if (parameters->message_unload_delay_ != 0 &&
+        (parameters->message_unload_delay_ < 60 || parameters->message_unload_delay_ > 86400)) {
+      return td::Status::Error("Message unload delay must be between 60 and 86400");
+    }
+    if (tdlib_restart_interval < 0 || tdlib_restart_memory_limit < 0 || tdlib_restart_min_uptime < 0 ||
+        tdlib_restart_cooldown < 0) {
+      return td::Status::Error("Wrong TDLib restart parameters specified");
+    }
+    if (tdlib_restart_drain_timeout <= 0) {
+      return td::Status::Error("TDLib restart drain timeout must be positive");
+    }
+    if (tdlib_restart_memory_limit > (static_cast<td::int64>(1) << 40)) {
+      return td::Status::Error("Too big TDLib restart memory limit specified");
     }
     return td::Status::OK();
   });
@@ -478,6 +531,12 @@ int main(int argc, char *argv[]) {
 
   parameters->working_directory_ = std::move(working_directory);
   parameters->files_directory_ = std::move(files_directory);
+
+  parameters->tdlib_restart_interval_ = static_cast<double>(tdlib_restart_interval);
+  parameters->tdlib_restart_memory_limit_ = tdlib_restart_memory_limit << 20;
+  parameters->tdlib_restart_min_uptime_ = static_cast<double>(tdlib_restart_min_uptime);
+  parameters->tdlib_restart_drain_timeout_ = static_cast<double>(tdlib_restart_drain_timeout);
+  parameters->tdlib_restart_cooldown_ = static_cast<double>(tdlib_restart_cooldown);
 
   if (parameters->default_max_webhook_connections_ <= 0) {
     parameters->default_max_webhook_connections_ = parameters->local_mode_ ? 100 : 40;

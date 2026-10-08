@@ -21,6 +21,7 @@
 #include "td/net/HttpFile.h"
 
 #include "td/actor/MultiPromise.h"
+#include "td/actor/SleepActor.h"
 
 #include "td/utils/common.h"
 #include "td/utils/format.h"
@@ -30,6 +31,7 @@
 #include "td/utils/port/IPAddress.h"
 #include "td/utils/port/Stat.h"
 #include "td/utils/port/thread.h"
+#include "td/utils/Random.h"
 #include "td/utils/Slice.h"
 #include "td/utils/SliceBuilder.h"
 #include "td/utils/StackAllocator.h"
@@ -41,6 +43,10 @@
 #include <algorithm>
 #include <atomic>
 #include <tuple>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace telegram_bot_api {
 
@@ -135,12 +141,10 @@ void ClientManager::send(PromisedQueryPtr query) {
       // return query->set_retry_after_error(1);
     }
 
-    auto id =
-        clients_.create(ClientInfo{BotStatActor(stat_.actor_id(&stat_)), token, tqueue_id, td::ActorOwn<Client>()});
+    auto id = clients_.create(ClientInfo(BotStatActor(stat_.actor_id(&stat_)), token, tqueue_id, query->token().str(),
+                                         query->is_test_dc(), td::Time::now()));
+    create_client_actor(id);
     auto *client_info = clients_.get(id);
-    client_info->client_ = td::create_actor<Client>(PSLICE() << "Client/" << token, actor_shared(this, id),
-                                                    query->token().str(), query->is_test_dc(), tqueue_id, parameters_,
-                                                    client_info->stat_.actor_id(&client_info->stat_));
 
     if (method != "deletewebhook" && method != "setwebhook") {
       auto bot_token_with_dc = PSTRING() << query->token() << (query->is_test_dc() ? ":T" : "");
@@ -153,8 +157,287 @@ void ClientManager::send(PromisedQueryPtr query) {
 
     std::tie(id_it, std::ignore) = token_to_id_.emplace(token, id);
   }
-  send_closure(clients_.get(id_it->second)->client_, &Client::send,
-               std::move(query));  // will send 429 if the client is already closed
+  auto *client_info = clients_.get(id_it->second);
+  CHECK(client_info != nullptr);
+  if (client_info->restart_state_ != ClientInfo::RestartState::None) {
+    // the query will be sent to the restarted Client
+    if (client_info->restart_queries_.size() >= MAX_RESTART_QUERIES) {
+      return query->set_retry_after_error(1);
+    }
+    client_info->restart_queries_.push(std::move(query));
+    return;
+  }
+  send_closure(client_info->client_, &Client::send, std::move(query));  // will send 429 if the client is already closed
+}
+
+void ClientManager::create_client_actor(td::uint64 id) {
+  auto *client_info = clients_.get(id);
+  CHECK(client_info != nullptr);
+  CHECK(client_info->client_.empty());
+  auto now = td::Time::now();
+  client_info->start_time_ = now;
+  client_info->scheduled_restart_time_ = get_scheduled_restart_time(now);
+  client_info->client_ =
+      td::create_actor<Client>(PSLICE() << "Client/" << client_info->token_, actor_shared(this, id),
+                               client_info->bot_token_, client_info->is_test_dc_, client_info->tqueue_id_, parameters_,
+                               client_info->stat_.actor_id(&client_info->stat_), client_info->first_start_time_);
+}
+
+void ClientManager::schedule_restart_check() {
+  td::create_actor<td::SleepActor>("RestartCheckSleepActor", RESTART_CHECK_PERIOD,
+                                   td::PromiseCreator::lambda([actor_id = actor_id(this)](td::Result<td::Unit>) {
+                                     send_closure(actor_id, &ClientManager::on_restart_check_timer);
+                                   }))
+      .release();
+}
+
+void ClientManager::on_restart_check_timer() {
+  if (close_flag_) {
+    return;
+  }
+  auto now = td::Time::now();
+  check_restarts(now);
+
+#if defined(__GLIBC__)
+  if (malloc_trim_time_ > 0.0 && now >= malloc_trim_time_) {
+    malloc_trim_time_ = 0.0;
+    td::Scheduler::instance()->run_on_scheduler(SharedData::get_file_gc_scheduler_id(), [](td::Unit) {
+      auto start_time = td::Time::now();
+      malloc_trim(0);
+      LOG(WARNING) << "Released free memory to the OS in " << (td::Time::now() - start_time) << " seconds";
+    });
+  }
+#endif
+
+  schedule_restart_check();
+}
+
+double ClientManager::get_scheduled_restart_time(double now) const {
+  auto restart_interval = parameters_->tdlib_restart_interval_;
+  if (restart_interval <= 0.0) {
+    return 0.0;
+  }
+  // add up to 10% of random delay to spread restarts of different bots in time
+  return now + restart_interval * (1.0 + 0.1 * td::Random::fast(0, 1000) * 1e-3);
+}
+
+td::Slice ClientManager::get_restart_state_name(ClientInfo::RestartState state) {
+  switch (state) {
+    case ClientInfo::RestartState::None:
+      return td::Slice("none");
+    case ClientInfo::RestartState::Draining:
+      return td::Slice("draining");
+    case ClientInfo::RestartState::Closing:
+      return td::Slice("closing");
+    default:
+      UNREACHABLE();
+      return td::Slice();
+  }
+}
+
+td::int32 ClientManager::request_restart(td::Slice bot_id) {
+  td::int32 result = 0;
+  for (auto id : clients_.ids()) {
+    auto *client_info = clients_.get(id);
+    CHECK(client_info != nullptr);
+    if (client_info->restart_state_ != ClientInfo::RestartState::None) {
+      continue;
+    }
+    if (bot_id == "all" || (td::begins_with(client_info->token_, bot_id) &&
+                            client_info->token_.size() > bot_id.size() && client_info->token_[bot_id.size()] == ':')) {
+      LOG(WARNING) << "Graceful restart of TDLib instance of bot " << client_info->tqueue_id_ << " was requested";
+      client_info->is_restart_requested_ = true;
+      result++;
+    }
+  }
+  return result;
+}
+
+void ClientManager::check_restarts(double now) {
+  if (close_flag_) {
+    return;
+  }
+
+  if (restarting_client_id_ != 0) {
+    auto *client_info = clients_.get(restarting_client_id_);
+    if (client_info == nullptr || client_info->restart_state_ == ClientInfo::RestartState::None) {
+      restarting_client_id_ = 0;
+    } else {
+      if (now > client_info->restart_start_time_ + parameters_->tdlib_restart_drain_timeout_ + MAX_RESTART_DURATION &&
+          !client_info->restart_queries_.empty()) {
+        // must never happen; don't keep connections open forever
+        LOG(ERROR) << "Restart of TDLib instance of bot " << client_info->tqueue_id_ << " lasts for "
+                   << (now - client_info->restart_start_time_) << " seconds in state "
+                   << get_restart_state_name(client_info->restart_state_);
+        fail_restart_queries(client_info);
+      }
+      // restart only one TDLib instance simultaneously
+      return;
+    }
+  }
+  if (now < next_restart_time_) {
+    return;
+  }
+
+  auto can_restart = [&](const ClientInfo *client_info) {
+    return client_info->restart_state_ == ClientInfo::RestartState::None && !client_info->client_.empty() &&
+           client_info->client_.get_actor_unsafe()->can_restart();
+  };
+
+  td::uint64 requested_client_id = 0;
+  td::uint64 scheduled_client_id = 0;
+  double min_scheduled_restart_time = now;
+  auto client_ids = clients_.ids();
+  for (auto id : client_ids) {
+    auto *client_info = clients_.get(id);
+    CHECK(client_info != nullptr);
+    if (client_info->is_restart_requested_) {
+      if (requested_client_id == 0 && can_restart(client_info)) {
+        requested_client_id = id;
+      }
+      continue;
+    }
+    if (client_info->scheduled_restart_time_ > 0.0 &&
+        client_info->scheduled_restart_time_ <= min_scheduled_restart_time && now >= client_info->restart_retry_time_ &&
+        can_restart(client_info)) {
+      min_scheduled_restart_time = client_info->scheduled_restart_time_;
+      scheduled_client_id = id;
+    }
+  }
+  if (requested_client_id != 0) {
+    return start_restart(requested_client_id, "request");
+  }
+
+  auto memory_limit = parameters_->tdlib_restart_memory_limit_;
+  if (memory_limit > 0 && now >= next_memory_check_time_) {
+    next_memory_check_time_ = now + RESTART_MEMORY_CHECK_PERIOD;
+    auto r_mem_stat = td::mem_stat();
+    if (r_mem_stat.is_ok() && r_mem_stat.ok().resident_size_ > static_cast<td::uint64>(memory_limit)) {
+      // restart the TDLib instance, which has received the biggest number of updates and is likely to be the biggest
+      td::uint64 heaviest_client_id = 0;
+      td::int64 max_update_count = -1;
+      for (auto id : client_ids) {
+        auto *client_info = clients_.get(id);
+        CHECK(client_info != nullptr);
+        if (now < client_info->start_time_ + parameters_->tdlib_restart_min_uptime_ ||
+            now < client_info->restart_retry_time_ || !can_restart(client_info)) {
+          continue;
+        }
+        auto update_count = client_info->client_.get_actor_unsafe()->get_tdlib_update_count();
+        if (update_count > max_update_count) {
+          max_update_count = update_count;
+          heaviest_client_id = id;
+        }
+      }
+      if (heaviest_client_id != 0) {
+        LOG(WARNING) << "Memory usage " << td::format::as_size(r_mem_stat.ok().resident_size_) << " exceeds the limit "
+                     << td::format::as_size(static_cast<td::uint64>(memory_limit));
+        return start_restart(heaviest_client_id, "memory limit");
+      }
+    }
+  }
+
+  if (scheduled_client_id != 0) {
+    return start_restart(scheduled_client_id, "uptime");
+  }
+}
+
+void ClientManager::start_restart(td::uint64 id, td::Slice reason) {
+  auto *client_info = clients_.get(id);
+  CHECK(client_info != nullptr);
+  CHECK(client_info->restart_state_ == ClientInfo::RestartState::None);
+  auto now = td::Time::now();
+  LOG(WARNING) << "Start graceful restart of TDLib instance of bot " << client_info->tqueue_id_ << " with uptime "
+               << (now - client_info->start_time_) << " because of " << reason;
+  client_info->restart_state_ = ClientInfo::RestartState::Draining;
+  client_info->restart_start_time_ = now;
+  client_info->is_restart_requested_ = false;
+  restarting_client_id_ = id;
+  next_restart_time_ = now + parameters_->tdlib_restart_cooldown_;
+  send_closure(client_info->client_, &Client::restart, parameters_->tdlib_restart_drain_timeout_,
+               td::PromiseCreator::lambda([actor_id = actor_id(this), id](td::Result<td::Unit> result) {
+                 send_closure(actor_id, &ClientManager::on_restart_closing, id, std::move(result));
+               }));
+}
+
+void ClientManager::on_restart_closing(td::uint64 id, td::Result<td::Unit> result) {
+  auto *client_info = clients_.get(id);
+  if (client_info == nullptr || client_info->restart_state_ != ClientInfo::RestartState::Draining) {
+    return;
+  }
+  if (result.is_ok()) {
+    client_info->restart_state_ = ClientInfo::RestartState::Closing;
+    return;
+  }
+
+  LOG(WARNING) << "Failed to restart TDLib instance of bot " << client_info->tqueue_id_ << ": "
+               << result.error().message();
+  client_info->restart_state_ = ClientInfo::RestartState::None;
+  client_info->failed_restart_count_++;
+  client_info->restart_retry_time_ =
+      td::Time::now() + RESTART_RETRY_DELAY * td::min(client_info->failed_restart_count_, 12);
+  total_failed_restart_count_++;
+  if (restarting_client_id_ == id) {
+    restarting_client_id_ = 0;
+  }
+  if (close_flag_) {
+    fail_restart_queries(client_info);
+  } else {
+    send_restart_queries(client_info);
+  }
+}
+
+void ClientManager::finish_restart(td::uint64 id) {
+  auto *client_info = clients_.get(id);
+  CHECK(client_info != nullptr);
+  CHECK(client_info->restart_state_ == ClientInfo::RestartState::Closing);
+  auto now = td::Time::now();
+  LOG(WARNING) << "Closed TDLib instance of bot " << client_info->tqueue_id_ << " for restart in "
+               << (now - client_info->restart_start_time_) << " seconds; have " << client_info->restart_queries_.size()
+               << " delayed queries";
+  client_info->restart_state_ = ClientInfo::RestartState::None;
+  client_info->restart_count_++;
+  client_info->failed_restart_count_ = 0;
+  client_info->restart_retry_time_ = 0.0;
+  total_restart_count_++;
+  if (restarting_client_id_ == id) {
+    restarting_client_id_ = 0;
+  }
+
+  create_client_actor(id);
+
+  // the webhook must be restored before any other query is processed
+  auto bot_token_with_dc = PSTRING() << client_info->bot_token_ << (client_info->is_test_dc_ ? ":T" : "");
+  auto webhook_info = parameters_->shared_data_->webhook_db_->get(bot_token_with_dc);
+  if (!webhook_info.empty()) {
+    send_closure(client_info->client_, &Client::send,
+                 get_webhook_restore_query(bot_token_with_dc, webhook_info, parameters_->shared_data_));
+  }
+
+  send_restart_queries(client_info);
+
+#if defined(__GLIBC__)
+  // return memory released by the closed TDLib instance to the OS
+  malloc_trim_time_ = now + MALLOC_TRIM_DELAY;
+#endif
+}
+
+void ClientManager::send_restart_queries(ClientInfo *client_info) {
+  std::queue<PromisedQueryPtr> queries;
+  std::swap(queries, client_info->restart_queries_);
+  while (!queries.empty()) {
+    send_closure(client_info->client_, &Client::send, std::move(queries.front()));
+    queries.pop();
+  }
+}
+
+void ClientManager::fail_restart_queries(ClientInfo *client_info) {
+  std::queue<PromisedQueryPtr> queries;
+  std::swap(queries, client_info->restart_queries_);
+  while (!queries.empty()) {
+    queries.front()->set_retry_after_error(1);
+    queries.pop();
+  }
 }
 
 ClientManager::TopClients ClientManager::get_top_clients(std::size_t max_count, td::Slice token_filter) {
@@ -201,11 +484,15 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
   td::StringBuilder sb(buf.as_slice());
 
   td::Slice id_filter;
+  td::Slice restart_filter;
   int new_verbosity_level = -1;
   td::string tag;
   for (auto &arg : args) {
     if (arg.first == "id") {
       id_filter = arg.second;
+    }
+    if (arg.first == "restart") {
+      restart_filter = arg.second;
     }
     if (arg.first == "v") {
       auto r_new_verbosity_level = td::to_integer_safe<int>(arg.second);
@@ -223,6 +510,10 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
     } else {
       td::ClientActor::execute(td::td_api::make_object<td::td_api::setLogTagVerbosityLevel>(tag, new_verbosity_level));
     }
+  }
+
+  if (!restart_filter.empty()) {
+    sb << "tdlib_restart_requested\t" << request_restart(restart_filter) << '\n';
   }
 
   auto now = td::Time::now();
@@ -249,6 +540,8 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
     }
 
     sb << "buffer_memory\t" << td::format::as_size(td::BufferAllocator::get_buffer_mem()) << '\n';
+    sb << "tdlib_restart_count\t" << total_restart_count_ << '\n';
+    sb << "tdlib_failed_restart_count\t" << total_failed_restart_count_ << '\n';
     sb << "active_webhook_connections\t" << WebhookActor::get_total_connection_count() << '\n';
     sb << "active_requests\t" << parameters_->shared_data_->query_count_.load(std::memory_order_relaxed) << '\n';
     sb << "active_network_queries\t" << td::get_pending_network_query_count(*parameters_->net_query_stats_) << '\n';
@@ -293,6 +586,18 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
     if (bot_info.pending_update_count_ != 0) {
       sb << "tail_update_id\t" << bot_info.tail_update_id_ << '\n';
       sb << "pending_update_count\t" << bot_info.pending_update_count_ << '\n';
+    }
+    sb << "tdlib_update_count\t" << client_info->client_.get_actor_unsafe()->get_tdlib_update_count() << '\n';
+    if (client_info->restart_count_ != 0) {
+      sb << "tdlib_restart_count\t" << client_info->restart_count_ << '\n';
+    }
+    if (client_info->scheduled_restart_time_ > 0.0) {
+      sb << "tdlib_next_restart_in\t" << td::max(client_info->scheduled_restart_time_ - now, 0.0) << '\n';
+    }
+    if (client_info->restart_state_ != ClientInfo::RestartState::None) {
+      sb << "tdlib_restart_state\t" << get_restart_state_name(client_info->restart_state_) << '\n';
+      sb << "tdlib_restart_duration\t" << now - client_info->restart_start_time_ << '\n';
+      sb << "tdlib_restart_delayed_query_count\t" << client_info->restart_queries_.size() << '\n';
     }
 
     auto stats = client_info->stat_.as_vector(now);
@@ -378,6 +683,8 @@ void ClientManager::start_up() {
   watchdog_id_ = td::create_actor_on_scheduler<Watchdog>("ManagerWatchdog", SharedData::get_watchdog_scheduler_id(),
                                                          td::this_thread::get_id(), WATCHDOG_TIMEOUT);
   set_timeout_in(600.0);
+
+  schedule_restart_check();
 }
 
 PromisedQueryPtr ClientManager::get_webhook_restore_query(td::Slice token, td::Slice webhook_info,
@@ -546,6 +853,7 @@ void ClientManager::timeout_expired() {
   set_timeout_in(WATCHDOG_TIMEOUT / 10);
 
   double now = td::Time::now();
+
   if (now > next_tqueue_gc_time_) {
     auto unix_time = parameters_->shared_data_->get_unix_time(now);
     LOG(INFO) << "Run TQueue GC at " << unix_time;
@@ -574,6 +882,15 @@ void ClientManager::hangup_shared() {
   auto *info = clients_.get(id);
   CHECK(info != nullptr);
   info->client_.release();
+
+  if (info->restart_state_ == ClientInfo::RestartState::Closing && !close_flag_) {
+    // the TDLib instance was closed for restart; create a new Client and send it all delayed queries
+    return finish_restart(id);
+  }
+  if (restarting_client_id_ == id) {
+    restarting_client_id_ = 0;
+  }
+
   token_to_id_.erase(info->token_);
   clients_.erase(id);
 

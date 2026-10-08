@@ -65,6 +65,12 @@ class WebhookActor final : public td::HttpOutboundConnection::Callback {
 
   void close();
 
+  // stops sending of new updates; the promise is resolved when there are no updates being sent
+  void pause(td::Promise<td::Unit> promise);
+
+  // continues sending of updates after pause
+  void resume();
+
   static td::int64 get_total_connection_count() {
     return total_connection_count_;
   }
@@ -93,6 +99,9 @@ class WebhookActor final : public td::HttpOutboundConnection::Callback {
   const bool fix_ip_address_ = false;
 
   bool stop_flag_ = false;
+
+  bool is_paused_ = false;
+  td::Promise<td::Unit> pause_promise_;
 
   bool was_checked_ = false;
   const bool from_db_flag_ = false;
@@ -199,6 +208,8 @@ class WebhookActor final : public td::HttpOutboundConnection::Callback {
   void drop_event(td::TQueue::EventId event_id);
 
   void load_updates();
+  std::size_t get_sending_update_count() const;
+  void check_paused();
   void on_update_ok(td::TQueue::EventId event_id);
   void on_update_error(td::TQueue::EventId event_id, td::Slice error, int retry_after);
   td::Status send_update() TD_WARN_UNUSED_RESULT;

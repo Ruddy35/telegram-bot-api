@@ -13,6 +13,7 @@ Please note that only global Bot API issues that affect all bots are suitable fo
 - [Documentation](#documentation)
 - [Moving a bot to a local server](#switching)
 - [Moving a bot from one local server to another](#moving)
+- [Releasing memory of TDLib instances](#memory)
 - [License](#license)
 
 <a name="installation"></a>
@@ -92,6 +93,25 @@ If you want to avoid losing updates between logging out on the old server and la
 [deleteWebhook](https://core.telegram.org/bots/api#deletewebhook), then use the method [close](https://core.telegram.org/bots/api#close) to close the bot instance.
 After the instance is closed, locate the bot's subdirectory in the working directory of the old server by the bot's user ID, move the subdirectory to the working directory of the new server
 and continue sending requests to the new server as usual.
+
+<a name="memory"></a>
+## Releasing memory of TDLib instances
+
+Each bot is served by a separate TDLib instance, which keeps all users, chats and files the bot has ever seen in memory,
+so memory usage of the server grows with time. The server can gracefully restart the TDLib instance of a bot without
+restarting the process: new requests of the bot are delayed, active requests are finished, all received updates are
+handled, then the TDLib instance is closed and reopened from the same database, and the delayed requests are processed.
+No request fails, no update is lost or sent twice, and other bots aren't affected.
+
+* `--tdlib-restart-memory-limit=<megabytes>` - restart TDLib instances of the most active bots one by one while memory
+  usage of the server exceeds the limit; see also `--tdlib-restart-min-uptime`.
+* `--tdlib-restart-interval=<seconds>` - restart TDLib instance of each bot after the specified uptime.
+* `--tdlib-restart-drain-timeout=<seconds>` - maximum time to wait for active requests of a bot; the restart is postponed
+  if the time is exceeded.
+* `--message-unload-delay=<seconds>` - delay after which unused messages are unloaded from TDLib memory.
+* `GET http://<stat address>:<stat port>/?restart=<bot_id>|all` - request a restart manually.
+
+See [MEMORY.md](MEMORY.md) for details (in Russian).
 
 <a name="license"></a>
 ## License

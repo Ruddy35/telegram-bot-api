@@ -87,6 +87,12 @@ add_executable(telegram-bot-api ${TELEGRAM_BOT_API_SOURCE})
 target_include_directories(telegram-bot-api PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
 target_link_libraries(telegram-bot-api PRIVATE memprof tdactor tdcore tddb tdnet tdutils)
 
+# test-only tools for test/restart/restart_test.py
+add_executable(restart-test-fake-auth EXCLUDE_FROM_ALL test/restart/fake_auth.cpp)
+target_link_libraries(restart-test-fake-auth PRIVATE tdmtproto tddb tdutils)
+add_executable(restart-test-fake-updates EXCLUDE_FROM_ALL test/restart/fake_updates.cpp)
+target_link_libraries(restart-test-fake-updates PRIVATE tddb tdutils)
+
 install(TARGETS telegram-bot-api RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 if (MSVC AND VCPKG_TOOLCHAIN)
   install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/$<CONFIG>/" DESTINATION "${CMAKE_INSTALL_BINDIR}" FILES_MATCHING PATTERN "*.dll" PATTERN "*.pdb")

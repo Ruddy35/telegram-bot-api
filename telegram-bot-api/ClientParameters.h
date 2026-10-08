@@ -118,6 +118,16 @@ struct ClientParameters {
   td::int32 default_max_webhook_connections_ = 0;
   td::IPAddress webhook_proxy_ip_address_;
 
+  // value of the TDLib option "message_unload_delay"; 0 if the default value must be used
+  td::int32 message_unload_delay_ = 0;
+
+  // graceful restart of TDLib instances to release memory
+  double tdlib_restart_interval_ = 0.0;        // restart TDLib instances after the specified uptime; 0 if disabled
+  td::int64 tdlib_restart_memory_limit_ = 0;   // restart TDLib instances while RSS exceeds the limit; 0 if disabled
+  double tdlib_restart_min_uptime_ = 3600.0;   // minimum TDLib instance uptime for a restart due to the memory limit
+  double tdlib_restart_drain_timeout_ = 30.0;  // maximum time to wait for active requests before a restart
+  double tdlib_restart_cooldown_ = 10.0;       // minimum time between automatic restarts
+
   double start_time_ = 0;
 
   td::ActorId<td::GetHostByNameActor> get_host_by_name_actor_id_;

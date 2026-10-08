@@ -332,10 +332,10 @@ void WebhookActor::loop() {
   if (!stop_flag_) {
     resolve_ip_address();
   }
-  if (!stop_flag_) {
+  if (!stop_flag_ && !is_paused_) {
     create_new_connections();
   }
-  if (!stop_flag_) {
+  if (!stop_flag_ && !is_paused_) {
     send_updates();
   }
   if (!stop_flag_) {
@@ -346,7 +346,53 @@ void WebhookActor::loop() {
   if (stop_flag_) {
     VLOG(webhook) << "Stop";
     stop();
+    return;
   }
+  check_paused();
+}
+
+void WebhookActor::pause(td::Promise<td::Unit> promise) {
+  VLOG(webhook) << "Pause";
+  if (pause_promise_) {
+    pause_promise_.set_error(td::Status::Error(500, "Webhook pause was requested again"));
+  }
+  is_paused_ = true;
+  pause_promise_ = std::move(promise);
+  check_paused();
+}
+
+void WebhookActor::resume() {
+  VLOG(webhook) << "Resume";
+  if (pause_promise_) {
+    pause_promise_.set_error(td::Status::Error(500, "Webhook was resumed"));
+  }
+  is_paused_ = false;
+  loop();
+}
+
+std::size_t WebhookActor::get_sending_update_count() const {
+  std::size_t result = 0;
+  for (auto id : connections_.ids()) {
+    auto *connection = connections_.get(id);
+    CHECK(connection != nullptr);
+    if (!connection->event_id_.empty()) {
+      result++;
+    }
+  }
+  return result;
+}
+
+void WebhookActor::check_paused() {
+  if (!is_paused_ || !pause_promise_) {
+    return;
+  }
+  auto sending_update_count = get_sending_update_count();
+  if (sending_update_count != 0) {
+    VLOG(webhook) << "Wait for " << sending_update_count << " updates being sent before pause";
+    return;
+  }
+  VLOG(webhook) << "Paused";
+  pause_promise_.set_value(td::Unit());
 }
 
 void WebhookActor::update() {

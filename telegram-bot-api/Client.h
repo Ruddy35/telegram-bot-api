@@ -43,7 +43,8 @@ namespace td_api = td::td_api;
 class Client final : public WebhookActor::Callback {
  public:
   Client(td::ActorShared<> parent, const td::string &bot_token, bool is_test_dc, td::int64 tqueue_id,
-         std::shared_ptr<const ClientParameters> parameters, td::ActorId<BotStatActor> stat_actor);
+         std::shared_ptr<const ClientParameters> parameters, td::ActorId<BotStatActor> stat_actor,
+         double first_start_time = 0.0);
   Client(const Client &) = delete;
   Client &operator=(const Client &) = delete;
   Client(Client &&) = delete;
@@ -54,8 +55,26 @@ class Client final : public WebhookActor::Callback {
 
   void close();
 
+  // Gracefully closes the TDLib instance to release all memory used by it. The Client waits until all active requests
+  // are answered and all received updates are handled, then closes the TDLib instance and stops itself without failing
+  // any request. The caller must not send new queries to the Client after the call and must create a new Client for
+  // the bot after the Client is stopped. The promise is resolved right before the TDLib instance is closed, or fails if
+  // the restart can't be done now; in the latter case the Client continues to work as usual.
+  void restart(double max_drain_time, td::Promise<td::Unit> promise);
+
   // for stats
   ServerBotInfo get_bot_info() const;
+
+  // returns true if the Client can be gracefully restarted now
+  bool can_restart() const {
+    return !td_client_.empty() && was_authorized_ && !closing_ && !logging_out_ && !need_close_ &&
+           restart_state_ == RestartState::None;
+  }
+
+  // the number of updates received from the TDLib instance; used as an estimation of its memory usage
+  td::int64 get_tdlib_update_count() const {
+    return tdlib_update_count_;
+  }
 
  private:
   using int32 = td::int32;
@@ -275,6 +294,7 @@ class Client final : public WebhookActor::Callback {
   class JsonCustomJson;
 
   class TdOnOkCallback;
+  class TdOnRestartNetworkTypeCallback;
   class TdOnAuthorizationCallback;
   class TdOnInitCallback;
   class TdOnGetUserProfilePhotosCallback;
@@ -500,6 +520,18 @@ class Client final : public WebhookActor::Callback {
   void finish_closing();
 
   void clear_tqueue();
+
+  bool is_restart_in_progress() const;
+
+  bool is_ready_for_restart() const;
+
+  void check_restart();
+
+  void on_restart_network_disabled(td::uint64 restart_generation, bool is_ok);
+
+  void on_webhook_paused(td::uint64 restart_generation);
+
+  void cancel_restart(td::Slice reason);
 
   bool allow_update_before_authorization(const td_api::Object *update) const;
 
@@ -1587,6 +1619,20 @@ class Client final : public WebhookActor::Callback {
   bool need_close_ = false;
   bool clear_tqueue_ = false;
 
+  // graceful restart of the TDLib instance
+  enum class RestartState : td::int8 { None, Draining, GoingOffline, Offline, Closing };
+  RestartState restart_state_ = RestartState::None;
+  td::Promise<td::Unit> restart_promise_;
+  td::uint64 restart_generation_ = 0;
+  double restart_deadline_ = 0.0;
+  double restart_offline_check_time_ = 0.0;
+  bool is_webhook_paused_ = false;
+  static constexpr double RESTART_CHECK_INTERVAL = 0.05;
+  static constexpr double RESTART_OFFLINE_DELAY = 0.5;
+  static constexpr double RESTART_NETWORK_TIMEOUT = 5.0;
+
+  td::int64 tdlib_update_count_ = 0;
+
   td::ActorShared<> parent_;
   td::string bot_token_;
   td::string bot_token_with_dc_;
@@ -1594,6 +1640,7 @@ class Client final : public WebhookActor::Callback {
   bool is_test_dc_;
   int64 tqueue_id_;
   double start_time_ = 0;
+  double first_start_time_ = 0;  // start time of the first Client for the bot before graceful restarts
 
   int64 my_id_ = -1;
   int32 authorization_date_ = -1;

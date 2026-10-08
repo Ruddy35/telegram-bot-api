@@ -42,12 +42,14 @@ using td_api::make_object;
 using td_api::move_object_as;
 
 Client::Client(td::ActorShared<> parent, const td::string &bot_token, bool is_test_dc, int64 tqueue_id,
-               std::shared_ptr<const ClientParameters> parameters, td::ActorId<BotStatActor> stat_actor)
+               std::shared_ptr<const ClientParameters> parameters, td::ActorId<BotStatActor> stat_actor,
+               double first_start_time)
     : parent_(std::move(parent))
     , bot_token_(bot_token)
     , bot_token_id_("<unknown>")
     , is_test_dc_(is_test_dc)
     , tqueue_id_(tqueue_id)
+    , first_start_time_(first_start_time)
     , parameters_(std::move(parameters))
     , stat_actor_(std::move(stat_actor)) {
   static auto is_inited = init_methods();
@@ -6736,6 +6738,24 @@ class Client::TdOnOkCallback final : public TdQueryCallback {
   }
 };
 
+class Client::TdOnRestartNetworkTypeCallback final : public TdQueryCallback {
+ public:
+  TdOnRestartNetworkTypeCallback(Client *client, td::uint64 restart_generation)
+      : client_(client), restart_generation_(restart_generation) {
+  }
+
+  void on_result(object_ptr<td_api::Object> result) final {
+    if (result->get_id() == td_api::error::ID) {
+      LOG(WARNING) << "Failed to disable network before restart: " << td::oneline(to_string(result));
+    }
+    client_->on_restart_network_disabled(restart_generation_, result->get_id() != td_api::error::ID);
+  }
+
+ private:
+  Client *client_;
+  td::uint64 restart_generation_;
+};
+
 class Client::TdOnAuthorizationCallback final : public TdQueryCallback {
  public:
   explicit TdOnAuthorizationCallback(Client *client) : client_(client) {
@@ -8506,6 +8526,153 @@ void Client::close() {
   }
 }
 
+void Client::restart(double max_drain_time, td::Promise<td::Unit> promise) {
+  if (restart_state_ != RestartState::None) {
+    return promise.set_error(td::Status::Error(400, "Restart is already in progress"));
+  }
+  if (td_client_.empty() || !was_authorized_ || closing_ || logging_out_ || need_close_) {
+    return promise.set_error(td::Status::Error(400, "The bot isn't ready for restart"));
+  }
+
+  LOG(WARNING) << "Start graceful restart of TDLib instance after " << tdlib_update_count_ << " updates received in "
+               << (td::Time::now() - start_time_) << " seconds";
+  restart_state_ = RestartState::Draining;
+  restart_promise_ = std::move(promise);
+  restart_generation_++;
+  restart_deadline_ = td::Time::now() + max_drain_time;
+  is_webhook_paused_ = false;
+
+  if (!webhook_id_.empty()) {
+    // don't start sending of new updates to avoid their duplication after restart
+    send_closure(webhook_id_, &WebhookActor::pause,
+                 td::PromiseCreator::lambda(
+                     [actor_id = actor_id(this), restart_generation = restart_generation_](td::Result<td::Unit>) {
+                       send_closure(actor_id, &Client::on_webhook_paused, restart_generation);
+                     }));
+  }
+
+  // answer the active getUpdates request immediately; new requests are kept by the ClientManager till the restart end
+  long_poll_wakeup(true);
+
+  check_restart();
+}
+
+bool Client::is_restart_in_progress() const {
+  return restart_state_ != RestartState::None && restart_state_ != RestartState::Closing;
+}
+
+bool Client::is_ready_for_restart() const {
+  // there must be no active requests, no active requests to TDLib and no partially handled updates
+  if (!cmd_queue_.empty() || !handlers_.empty() || !pending_updates_.empty() || long_poll_query_ ||
+      webhook_set_query_ || active_webhook_set_query_ || (!webhook_id_.empty() && !is_webhook_paused_)) {
+    return false;
+  }
+  if (!pending_send_message_queries_.empty() || !yet_unsent_messages_.empty() || !yet_unsent_stories_.empty() ||
+      !file_download_listeners_.empty() || !pending_bot_resolve_queries_.empty()) {
+    return false;
+  }
+  if (!new_message_queues_.empty() || !new_business_message_queues_.empty() || !new_guest_query_queues_.empty() ||
+      !new_callback_query_queues_.empty() || !new_business_callback_query_queues_.empty()) {
+    return false;
+  }
+  return stat_actor_.get_actor_unsafe()->get_active_request_count() == 0;
+}
+
+void Client::check_restart() {
+  auto now = td::Time::now();
+  switch (restart_state_) {
+    case RestartState::Draining:
+      if (now >= restart_deadline_) {
+        return cancel_restart("active requests weren't finished in time");
+      }
+      if (!is_ready_for_restart()) {
+        return set_timeout_in(RESTART_CHECK_INTERVAL);
+      }
+
+      // stop receiving of new updates to be sure that all received updates are handled before the instance is closed
+      LOG(INFO) << "Disable network before restart";
+      restart_state_ = RestartState::GoingOffline;
+      restart_offline_check_time_ = now + RESTART_NETWORK_TIMEOUT;
+      set_timeout_at(restart_offline_check_time_);
+      return do_send_request(make_object<td_api::setNetworkType>(make_object<td_api::networkTypeNone>()),
+                             td::make_unique<TdOnRestartNetworkTypeCallback>(this, restart_generation_));
+    case RestartState::GoingOffline:
+      if (now >= restart_offline_check_time_) {
+        return cancel_restart("network wasn't disabled in time");
+      }
+      return set_timeout_at(restart_offline_check_time_);
+    case RestartState::Offline:
+      if (now < restart_offline_check_time_) {
+        return set_timeout_at(restart_offline_check_time_);
+      }
+      if (!is_ready_for_restart()) {
+        // some updates were received after the last check, and their handling may require network
+        LOG(INFO) << "Enable network back, because there are unhandled updates";
+        restart_state_ = RestartState::Draining;
+        send_request(make_object<td_api::setNetworkType>(make_object<td_api::networkTypeOther>()),
+                     td::make_unique<TdOnOkCallback>());
+        if (now >= restart_deadline_) {
+          return cancel_restart("received updates weren't handled in time");
+        }
+        return set_timeout_in(RESTART_CHECK_INTERVAL);
+      }
+
+      LOG(WARNING) << "Close TDLib instance for restart";
+      restart_state_ = RestartState::Closing;
+      cancel_timeout();
+      restart_promise_.set_value(td::Unit());
+      need_close_ = true;
+      return do_send_request(make_object<td_api::close>(), td::make_unique<TdOnOkCallback>());
+    case RestartState::None:
+    case RestartState::Closing:
+      return;
+    default:
+      UNREACHABLE();
+  }
+}
+
+void Client::on_restart_network_disabled(td::uint64 restart_generation, bool is_ok) {
+  if (restart_generation != restart_generation_ || restart_state_ != RestartState::GoingOffline) {
+    return;
+  }
+  if (!is_ok) {
+    restart_state_ = RestartState::Offline;  // the network could be disabled anyway
+    return cancel_restart("failed to disable network");
+  }
+
+  // wait for updates, which could have been already received from network
+  restart_state_ = RestartState::Offline;
+  restart_offline_check_time_ = td::Time::now() + RESTART_OFFLINE_DELAY;
+  set_timeout_at(restart_offline_check_time_);
+}
+
+void Client::on_webhook_paused(td::uint64 restart_generation) {
+  if (restart_generation != restart_generation_ || !is_restart_in_progress()) {
+    return;
+  }
+  LOG(INFO) << "Webhook was paused before restart";
+  is_webhook_paused_ = true;
+}
+
+void Client::cancel_restart(td::Slice reason) {
+  CHECK(is_restart_in_progress());
+  LOG(WARNING) << "Cancel graceful restart of TDLib instance: " << reason;
+  auto old_state = restart_state_;
+  restart_state_ = RestartState::None;
+  restart_generation_++;
+  is_webhook_paused_ = false;
+  cancel_timeout();
+
+  if (old_state == RestartState::GoingOffline || old_state == RestartState::Offline) {
+    send_request(make_object<td_api::setNetworkType>(make_object<td_api::networkTypeOther>()),
+                 td::make_unique<TdOnOkCallback>());
+  }
+  if (!webhook_id_.empty()) {
+    send_closure(webhook_id_, &WebhookActor::resume);
+  }
+  restart_promise_.set_error(td::Status::Error(500, reason));
+}
+
 void Client::log_out(int32 error_code, td::Slice error_message) {
   LOG(WARNING) << "Logging out due to error " << error_code << ": " << error_message;
   if (error_message == "API_ID_INVALID") {
@@ -8569,6 +8736,9 @@ ServerBotInfo Client::get_bot_info() const {
 void Client::start_up() {
   CHECK(start_time_ < 1e-10);
   start_time_ = td::Time::now();
+  if (first_start_time_ <= 0.0) {
+    first_start_time_ = start_time_;
+  }
   next_bot_updates_warning_time_ = start_time_ + 600;
   webhook_set_time_ = start_time_;
   next_allowed_set_webhook_time_ = start_time_;
@@ -9407,6 +9577,17 @@ void Client::on_update_authorization_state() {
         send_request(make_object<td_api::setOption>(option, make_object<td_api::optionValueBoolean>(true)),
                      td::make_unique<TdOnOkCallback>());
       }
+      {
+        // the option is persistent, so it must be reset to the default value if it isn't specified explicitly
+        object_ptr<td_api::OptionValue> message_unload_delay;
+        if (parameters_->message_unload_delay_ > 0) {
+          message_unload_delay = make_object<td_api::optionValueInteger>(parameters_->message_unload_delay_);
+        } else {
+          message_unload_delay = make_object<td_api::optionValueEmpty>();
+        }
+        send_request(make_object<td_api::setOption>("message_unload_delay", std::move(message_unload_delay)),
+                     td::make_unique<TdOnOkCallback>());
+      }
 
       auto request = make_object<td_api::setTdlibParameters>();
       request->use_test_dc_ = is_test_dc_;
@@ -9462,6 +9643,9 @@ void Client::on_update_authorization_state() {
           td::send_event(parent_, td::Event::raw(nullptr));
         }
       }
+      if (is_restart_in_progress()) {
+        cancel_restart("logging out");
+      }
       return loop();
     case td_api::authorizationStateClosing::ID:
       if (!closing_) {
@@ -9471,6 +9655,9 @@ void Client::on_update_authorization_state() {
         if (was_authorized_ && !logging_out_) {
           td::send_event(parent_, td::Event::raw(nullptr));
         }
+      }
+      if (is_restart_in_progress()) {
+        cancel_restart("closing");
       }
       return loop();
     case td_api::authorizationStateClosed::ID:
@@ -9505,6 +9692,7 @@ void Client::update_shared_unix_time_difference() {
 }
 
 void Client::on_update(object_ptr<td_api::Object> result) {
+  tdlib_update_count_++;
   if (!was_authorized_ && !allow_update_before_authorization(result.get())) {
     pending_updates_.push_back(std::move(result));
     return;
@@ -10037,6 +10225,13 @@ void Client::finish_closing() {
 }
 
 void Client::timeout_expired() {
+  if (is_restart_in_progress()) {
+    return check_restart();
+  }
+  if (!td_client_.empty()) {
+    // the timeout is used to stop the Client only after the TDLib instance is closed
+    return;
+  }
   LOG(WARNING) << "Stop client";
   stop();
 }
@@ -13736,8 +13931,8 @@ void Client::on_cmd(PromisedQueryPtr query, bool force) {
   LOG(DEBUG) << "Process query " << *query;
   if (!td_client_.empty() && was_authorized_) {
     if (query->method() == "close") {
-      auto retry_after = static_cast<int>(10 * 60 - (td::Time::now() - start_time_));
-      if (retry_after > 0 && start_time_ > parameters_->start_time_ + 10 * 60) {
+      auto retry_after = static_cast<int>(10 * 60 - (td::Time::now() - first_start_time_));
+      if (retry_after > 0 && first_start_time_ > parameters_->start_time_ + 10 * 60) {
         return query->set_retry_after_error(retry_after);
       }
       need_close_ = true;
