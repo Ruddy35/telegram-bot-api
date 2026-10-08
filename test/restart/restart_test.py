@@ -132,7 +132,8 @@ class Load:
         self.latencies = []
         self.count = 0
         self.lock = threading.Lock()
-        self.threads = [threading.Thread(target=self.run, args=(methods[i % len(methods)],)) for i in range(threads)]
+        self.threads = [threading.Thread(target=self.run, args=(methods[i % len(methods)],), daemon=True)
+                        for i in range(threads)]
         for t in self.threads:
             t.start()
 
