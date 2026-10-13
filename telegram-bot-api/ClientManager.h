@@ -6,6 +6,7 @@
 //
 #pragma once
 
+#include "telegram-bot-api/BotMetrics.h"
 #include "telegram-bot-api/Client.h"
 #include "telegram-bot-api/Query.h"
 #include "telegram-bot-api/Stats.h"
@@ -21,6 +22,7 @@
 #include "td/utils/Promise.h"
 #include "td/utils/Slice.h"
 
+#include <array>
 #include <memory>
 #include <queue>
 #include <utility>
@@ -49,6 +51,12 @@ class ClientManager final : public td::Actor {
 
   void get_stats(td::Promise<td::BufferSlice> promise, td::vector<std::pair<td::string, td::string>> args);
 
+  // returns metrics in the Prometheus text exposition format
+  void get_metrics(td::Promise<td::BufferSlice> promise, td::vector<std::pair<td::string, td::string>> args);
+
+  // the HTTP client has closed connection before receiving an answer to the query
+  void on_query_abandoned(td::string token, td::string method);
+
   void close(td::Promise<td::Unit> &&promise);
 
  private:
@@ -62,7 +70,9 @@ class ClientManager final : public td::Actor {
         , tqueue_id_(tqueue_id)
         , bot_token_(std::move(bot_token))
         , is_test_dc_(is_test_dc)
-        , first_start_time_(first_start_time) {
+        , first_start_time_(first_start_time)
+        , metrics_(std::make_shared<BotMetrics>()) {
+      stat_.set_metrics(metrics_);
     }
 
     BotStatActor stat_;
@@ -74,6 +84,9 @@ class ClientManager final : public td::Actor {
     bool is_test_dc_ = false;
     double first_start_time_ = 0.0;  // creation time of the first Client
     double start_time_ = 0.0;        // creation time of the current Client
+
+    std::shared_ptr<BotMetrics> metrics_;
+    bool was_authorized_ = false;
 
     // graceful restart of the TDLib instance
     // Pausing: getUpdates queries are delayed; Draining and Closing: all queries are delayed
@@ -114,6 +127,24 @@ class ClientManager final : public td::Actor {
   double malloc_trim_time_ = 0.0;
   td::int64 total_restart_count_ = 0;
   td::int64 total_failed_restart_count_ = 0;
+
+  // metrics of queries, which weren't sent to a Client
+  enum class RejectReason : td::int8 {
+    Closing,
+    InvalidToken,
+    MisdirectedToken,
+    ClosedBot,
+    IpFloodLimit,
+    GlobalFloodLimit,
+    Size
+  };
+  static td::Slice get_reject_reason_name(RejectReason reason);
+  std::array<td::int64, static_cast<std::size_t>(RejectReason::Size)> rejected_queries_{};
+  td::FlatHashMap<td::int32, td::int64> unauthorized_bot_requests_;  // HTTP status code -> count; for removed bots
+  double next_storage_statistics_time_ = 0.0;
+  static constexpr double STORAGE_STATISTICS_PERIOD = 60.0;
+
+  void add_bot_metrics(MetricsWriter &writer, const ClientInfo &client_info, double now);
 
   static constexpr double WATCHDOG_TIMEOUT = 0.25;
   static constexpr std::size_t MAX_RESTART_QUERIES = 10000;

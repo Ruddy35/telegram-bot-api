@@ -42,10 +42,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstring>
 #include <tuple>
 
 #if defined(__GLIBC__)
 #include <malloc.h>
+#endif
+
+#if TD_LINUX
+#include <unistd.h>
 #endif
 
 namespace telegram_bot_api {
@@ -73,20 +79,24 @@ void ClientManager::close(td::Promise<td::Unit> &&promise) {
 void ClientManager::send(PromisedQueryPtr query) {
   if (close_flag_) {
     // automatically send 429
+    rejected_queries_[static_cast<std::size_t>(RejectReason::Closing)]++;
     return;
   }
 
   td::string token = query->token().str();
   if (token[0] == '0' || token.size() > 80u || token.find('/') != td::string::npos ||
       token.find(':') == td::string::npos) {
+    rejected_queries_[static_cast<std::size_t>(RejectReason::InvalidToken)]++;
     return fail_query(401, "Unauthorized: invalid token specified", std::move(query));
   }
   auto r_user_id = td::to_integer_safe<td::int64>(query->token().substr(0, token.find(':')));
   if (r_user_id.is_error() || !token_range_(r_user_id.ok())) {
+    rejected_queries_[static_cast<std::size_t>(RejectReason::MisdirectedToken)]++;
     return fail_query(421, "Misdirected Request: forbidden token specified", std::move(query));
   }
   auto user_id = r_user_id.ok();
   if (user_id <= 0 || user_id >= (static_cast<td::int64>(1) << 54)) {
+    rejected_queries_[static_cast<std::size_t>(RejectReason::InvalidToken)]++;
     return fail_query(401, "Unauthorized: invalid token specified", std::move(query));
   }
 
@@ -98,6 +108,7 @@ void ClientManager::send(PromisedQueryPtr query) {
   if (id_it == token_to_id_.end()) {
     auto method = query->method();
     if (method == "close") {
+      rejected_queries_[static_cast<std::size_t>(RejectReason::ClosedBot)]++;
       return fail_query(400, "Bad Request: the bot has already been closed", std::move(query));
     }
 
@@ -123,6 +134,7 @@ void ClientManager::send(PromisedQueryPtr query) {
       auto wakeup_at = flood_control.get_wakeup_at();
       if (wakeup_at > now) {
         LOG(INFO) << "Failed to create Client from IP address " << ip_address << " with token";
+        rejected_queries_[static_cast<std::size_t>(RejectReason::IpFloodLimit)]++;
         return query->set_retry_after_error(static_cast<int>(wakeup_at - now) + 1);
       }
       flood_control.add_event(now);
@@ -132,6 +144,7 @@ void ClientManager::send(PromisedQueryPtr query) {
       auto wakeup_at = global_flood_control_.get_wakeup_at();
       if (wakeup_at > now) {
         LOG(WARNING) << "Failed to create Client with token " << token;
+        rejected_queries_[static_cast<std::size_t>(RejectReason::GlobalFloodLimit)]++;
         return query->set_retry_after_error(static_cast<int>(wakeup_at - now) + 1);
       }
       global_flood_control_.add_event(now);
@@ -163,7 +176,9 @@ void ClientManager::send(PromisedQueryPtr query) {
       (client_info->restart_state_ != ClientInfo::RestartState::Pausing || query->method() == "getupdates")) {
     // the query will be sent to the restarted Client
     if (client_info->restart_queries_.size() >= MAX_RESTART_QUERIES) {
-      return query->set_retry_after_error(1);
+      query->set_stat_method_id(Client::get_method_stat_id(query->method()));
+      query->set_stat_actor(client_info->stat_.actor_id(&client_info->stat_));
+      return query->set_retry_after_error(1, QueryFailReason::RestartQueueFull);
     }
     client_info->restart_queries_.push(std::move(query));
     return;
@@ -178,10 +193,10 @@ void ClientManager::create_client_actor(td::uint64 id) {
   auto now = td::Time::now();
   client_info->start_time_ = now;
   client_info->scheduled_restart_time_ = get_scheduled_restart_time(now);
-  client_info->client_ =
-      td::create_actor<Client>(PSLICE() << "Client/" << client_info->token_, actor_shared(this, id),
-                               client_info->bot_token_, client_info->is_test_dc_, client_info->tqueue_id_, parameters_,
-                               client_info->stat_.actor_id(&client_info->stat_), client_info->first_start_time_);
+  client_info->client_ = td::create_actor<Client>(
+      PSLICE() << "Client/" << client_info->token_, actor_shared(this, id), client_info->bot_token_,
+      client_info->is_test_dc_, client_info->tqueue_id_, parameters_, client_info->stat_.actor_id(&client_info->stat_),
+      client_info->metrics_, client_info->first_start_time_);
 }
 
 void ClientManager::schedule_restart_check() {
@@ -198,6 +213,17 @@ void ClientManager::on_restart_check_timer() {
   }
   auto now = td::Time::now();
   check_restarts(now);
+
+  if (now >= next_storage_statistics_time_) {
+    next_storage_statistics_time_ = now + STORAGE_STATISTICS_PERIOD;
+    for (auto id : clients_.ids()) {
+      auto *client_info = clients_.get(id);
+      CHECK(client_info != nullptr);
+      if (!client_info->client_.empty() && client_info->was_authorized_) {
+        send_closure(client_info->client_, &Client::update_storage_statistics);
+      }
+    }
+  }
 
 #if defined(__GLIBC__)
   if (malloc_trim_time_ > 0.0 && now >= malloc_trim_time_) {
@@ -463,7 +489,10 @@ void ClientManager::fail_restart_queries(ClientInfo *client_info) {
   std::queue<PromisedQueryPtr> queries;
   std::swap(queries, client_info->restart_queries_);
   while (!queries.empty()) {
-    queries.front()->set_retry_after_error(1);
+    auto &query = queries.front();
+    query->set_stat_method_id(Client::get_method_stat_id(query->method()));
+    query->set_stat_actor(client_info->stat_.actor_id(&client_info->stat_));
+    query->set_retry_after_error(1, QueryFailReason::RestartTimeout);
     queries.pop();
   }
 }
@@ -499,6 +528,315 @@ ClientManager::TopClients ClientManager::get_top_clients(std::size_t max_count, 
     result.top_client_ids.push_back(top_client_ids[i].second);
   }
   return result;
+}
+
+td::Slice ClientManager::get_reject_reason_name(RejectReason reason) {
+  switch (reason) {
+    case RejectReason::Closing:
+      return td::Slice("closing");
+    case RejectReason::InvalidToken:
+      return td::Slice("invalid_token");
+    case RejectReason::MisdirectedToken:
+      return td::Slice("misdirected_token");
+    case RejectReason::ClosedBot:
+      return td::Slice("closed_bot");
+    case RejectReason::IpFloodLimit:
+      return td::Slice("ip_flood_limit");
+    case RejectReason::GlobalFloodLimit:
+      return td::Slice("global_flood_limit");
+    default:
+      return td::Slice("unknown");
+  }
+}
+
+void ClientManager::on_query_abandoned(td::string token, td::string method) {
+  auto id_it = token_to_id_.find(token);
+  if (id_it == token_to_id_.end()) {
+    return;
+  }
+  auto *client_info = clients_.get(id_it->second);
+  CHECK(client_info != nullptr);
+  client_info->metrics_->on_query_abandoned(Client::get_method_stat_id(method));
+}
+
+void ClientManager::add_bot_metrics(MetricsWriter &writer, const ClientInfo &client_info, double now) {
+  CHECK(client_info.metrics_ != nullptr);
+  const auto &metrics = *client_info.metrics_;
+  auto bot_id = client_info.token_.substr(0, client_info.token_.find(':'));
+  td::string bot_label = PSTRING() << "bot=\"" << bot_id << (client_info.is_test_dc_ ? "_test" : "") << '"';
+  const td::Slice counter("counter");
+  const td::Slice gauge("gauge");
+
+  // requests
+  for (auto &it : metrics.requests_) {
+    auto key = BotMetrics::decode_request_key(it.first);
+    writer.add("tgbotapi_bot_requests_total", counter,
+               "Number of answered requests by method, HTTP status code and failure reason",
+               PSLICE() << bot_label << ",method=\"" << Client::get_method_stat_name(key.first) << "\",code=\""
+                        << key.second.first << "\",reason=\"" << BotMetrics::get_fail_reason_name(key.second.second)
+                        << '"',
+               it.second);
+  }
+  for (auto &it : metrics.method_totals_) {
+    td::string labels = PSTRING() << bot_label << ",method=\"" << Client::get_method_stat_name(it.first - 1) << '"';
+    const auto &totals = it.second;
+    writer.add("tgbotapi_bot_method_duration_seconds_total", counter,
+               "Total time between receiving of requests and sending of answers", labels, totals.duration);
+    writer.add("tgbotapi_bot_request_bytes_total", counter, "Total size of request parameters and files", labels,
+               totals.query_bytes);
+    writer.add("tgbotapi_bot_response_bytes_total", counter, "Total size of answers", labels, totals.answer_bytes);
+    writer.add("tgbotapi_bot_request_files_total", counter, "Number of files uploaded in requests", labels,
+               totals.file_count);
+    writer.add("tgbotapi_bot_request_file_bytes_total", counter, "Total size of files uploaded in requests", labels,
+               totals.file_bytes);
+  }
+  td::int64 cumulative_count = 0;
+  for (std::size_t i = 0; i <= BotMetrics::DURATION_BUCKET_COUNT; i++) {
+    cumulative_count += metrics.duration_buckets_[i];
+    char le[32];
+    if (i == BotMetrics::DURATION_BUCKET_COUNT) {
+      std::snprintf(le, sizeof(le), "+Inf");
+    } else {
+      std::snprintf(le, sizeof(le), "%g", BotMetrics::DURATION_BUCKETS[i]);
+    }
+    writer.add_sample("tgbotapi_bot_request_duration_seconds", "_bucket", td::Slice("histogram"),
+                      "Distribution of time between receiving of requests and sending of answers",
+                      PSLICE() << bot_label << ",le=\"" << td::Slice(le, std::strlen(le)) << '"', cumulative_count);
+  }
+  writer.add_sample("tgbotapi_bot_request_duration_seconds", "_sum", td::Slice("histogram"),
+                    "Distribution of time between receiving of requests and sending of answers", bot_label,
+                    metrics.duration_sum_);
+  writer.add_sample("tgbotapi_bot_request_duration_seconds", "_count", td::Slice("histogram"),
+                    "Distribution of time between receiving of requests and sending of answers", bot_label,
+                    metrics.duration_count_);
+  for (auto &it : metrics.abandoned_queries_) {
+    writer.add("tgbotapi_bot_abandoned_requests_total", counter,
+               "Number of requests, which connection was closed by the client before an answer was sent",
+               PSLICE() << bot_label << ",method=\"" << Client::get_method_stat_name(it.first - 1) << '"', it.second);
+  }
+
+  // files sent by the bot
+  for (auto &it : metrics.input_files_) {
+    auto key = BotMetrics::decode_input_file_key(it.first);
+    td::string labels = PSTRING() << bot_label << ",method=\"" << Client::get_method_stat_name(key.first)
+                                  << "\",type=\"" << BotMetrics::get_input_file_type_name(key.second) << '"';
+    writer.add("tgbotapi_bot_input_files_total", counter,
+               "Number of files passed to methods by type: upload, local_path, file_id or url", labels,
+               it.second.first);
+    writer.add("tgbotapi_bot_input_file_bytes_total", counter,
+               "Total size of uploaded and local files passed to methods", labels, it.second.second);
+  }
+
+  // updates
+  for (td::int32 type = 0; type < Client::get_update_type_count(); type++) {
+    if (static_cast<std::size_t>(type) >= BotMetrics::MAX_UPDATE_TYPES) {
+      break;
+    }
+    for (std::size_t result = 0; result < static_cast<std::size_t>(BotMetrics::UpdateResult::Size); result++) {
+      auto value = metrics.updates_[type][result];
+      if (value == 0) {
+        continue;
+      }
+      writer.add("tgbotapi_bot_updates_total", counter,
+                 "Number of updates by type and result: queued, filtered by allowed_updates or failed",
+                 PSLICE() << bot_label << ",type=\"" << Client::get_update_type_stat_name(type) << "\",result=\""
+                          << BotMetrics::get_update_result_name(static_cast<BotMetrics::UpdateResult>(result)) << '"',
+                 value);
+    }
+  }
+  writer.add("tgbotapi_bot_fetched_updates_total", counter, "Number of updates returned by getUpdates", bot_label,
+             metrics.fetched_updates_);
+  for (std::size_t result = 0; result < static_cast<std::size_t>(BotMetrics::WebhookResult::Size); result++) {
+    writer.add("tgbotapi_bot_webhook_deliveries_total", counter,
+               "Number of webhook update deliveries by result: ok, http_error, connection_error or dropped",
+               PSLICE() << bot_label << ",result=\""
+                        << BotMetrics::get_webhook_result_name(static_cast<BotMetrics::WebhookResult>(result)) << '"',
+               metrics.webhook_results_[result]);
+  }
+  writer.add("tgbotapi_bot_webhook_response_seconds_total", counter, "Total time of waiting for webhook responses",
+             bot_label, metrics.webhook_response_time_);
+  writer.add("tgbotapi_bot_webhook_connection_errors_total", counter, "Number of failed webhook connections", bot_label,
+             metrics.webhook_connection_errors_);
+
+  // downloads
+  writer.add("tgbotapi_bot_file_downloads_started_total", counter, "Number of started file downloads", bot_label,
+             metrics.started_downloads_);
+  for (std::size_t result = 0; result < static_cast<std::size_t>(BotMetrics::DownloadResult::Size); result++) {
+    writer.add("tgbotapi_bot_file_downloads_total", counter,
+               "Number of finished getFile downloads by result: completed, cached, too_big, error, closing or aborted",
+               PSLICE() << bot_label << ",result=\""
+                        << BotMetrics::get_download_result_name(static_cast<BotMetrics::DownloadResult>(result)) << '"',
+               metrics.finished_downloads_[result]);
+  }
+  writer.add("tgbotapi_bot_downloaded_bytes_total", counter, "Total size of completely downloaded files", bot_label,
+             metrics.downloaded_bytes_);
+  writer.add("tgbotapi_bot_partially_downloaded_bytes_total", counter,
+             "Total downloaded size of files, which download wasn't completed", bot_label,
+             metrics.partially_downloaded_bytes_);
+
+  // TDLib instance
+  writer.add("tgbotapi_bot_tdlib_updates_total", counter, "Number of updates received from TDLib", bot_label,
+             metrics.tdlib_updates_);
+  writer.add("tgbotapi_bot_tdlib_restarts_total", counter, "Number of graceful restarts of the TDLib instance",
+             bot_label, static_cast<td::int64>(client_info.restart_count_));
+  writer.add("tgbotapi_bot_tdlib_restart_in_progress", gauge, "Whether the TDLib instance is being restarted",
+             bot_label, static_cast<td::int64>(client_info.restart_state_ != ClientInfo::RestartState::None ? 1 : 0));
+  writer.add("tgbotapi_bot_tdlib_restart_delayed_requests", gauge, "Number of requests delayed by the restart",
+             bot_label, static_cast<td::int64>(client_info.restart_queries_.size()));
+  writer.add("tgbotapi_bot_instance_uptime_seconds", gauge, "Time since the start of the current TDLib instance",
+             bot_label, now - client_info.start_time_);
+
+  if (metrics.has_storage_statistics_) {
+    writer.add("tgbotapi_bot_storage_bytes", gauge, "Size of files and databases of the bot on the disk",
+               PSLICE() << bot_label << ",type=\"files\"", metrics.storage_files_size_);
+    writer.add("tgbotapi_bot_storage_bytes", gauge, "Size of files and databases of the bot on the disk",
+               PSLICE() << bot_label << ",type=\"database\"", metrics.storage_database_size_);
+    writer.add("tgbotapi_bot_storage_bytes", gauge, "Size of files and databases of the bot on the disk",
+               PSLICE() << bot_label << ",type=\"log\"", metrics.storage_log_size_);
+    writer.add("tgbotapi_bot_storage_files", gauge, "Number of files of the bot on the disk", bot_label,
+               metrics.storage_file_count_);
+  }
+
+  writer.add("tgbotapi_bot_active_requests", gauge, "Number of requests being processed", bot_label,
+             client_info.stat_.get_active_request_count());
+  writer.add("tgbotapi_bot_active_file_uploads", gauge, "Number of files being uploaded in requests", bot_label,
+             client_info.stat_.get_active_file_upload_count());
+  writer.add("tgbotapi_bot_active_file_upload_bytes", gauge, "Total size of files being uploaded in requests",
+             bot_label, client_info.stat_.get_active_file_upload_bytes());
+
+  if (!client_info.client_.empty()) {
+    const Client *client = client_info.client_.get_actor_unsafe();
+    auto bot_info = client->get_bot_info();
+    writer.add("tgbotapi_bot_info", gauge, "Information about the bot",
+               PSLICE() << bot_label << ",username=\"" << MetricsWriter::escape_label_value(bot_info.username_)
+                        << "\",webhook=\"" << (bot_info.webhook_.empty() ? "0" : "1") << '"',
+               static_cast<td::int64>(1));
+    writer.add("tgbotapi_bot_pending_updates", gauge, "Number of updates waiting to be received by the bot", bot_label,
+               static_cast<td::int64>(bot_info.pending_update_count_));
+
+    auto cache_stats = client->get_cache_stats();
+    auto add_cache = [&](td::Slice type, std::size_t value) {
+      writer.add("tgbotapi_bot_cached_objects", gauge, "Number of objects in the Bot API cache of the bot",
+                 PSLICE() << bot_label << ",type=\"" << type << '"', static_cast<td::int64>(value));
+    };
+    add_cache("message", cache_stats.message_count);
+    add_cache("user", cache_stats.user_count);
+    add_cache("group", cache_stats.group_count);
+    add_cache("supergroup", cache_stats.supergroup_count);
+    add_cache("chat", cache_stats.chat_count);
+    add_cache("community", cache_stats.community_count);
+    add_cache("business_connection", cache_stats.business_connection_count);
+    add_cache("sticker_set_name", cache_stats.sticker_set_name_count);
+    writer.add("tgbotapi_bot_pending_update_chats", gauge, "Number of chats with partially handled updates", bot_label,
+               static_cast<td::int64>(cache_stats.pending_update_chat_count));
+    writer.add("tgbotapi_bot_active_file_downloads", gauge, "Number of files being downloaded by getFile", bot_label,
+               static_cast<td::int64>(cache_stats.active_download_count));
+    writer.add("tgbotapi_bot_pending_sent_messages", gauge, "Number of requests waiting for sending of messages",
+               bot_label, static_cast<td::int64>(cache_stats.pending_send_message_count));
+  }
+}
+
+void ClientManager::get_metrics(td::Promise<td::BufferSlice> promise,
+                                td::vector<std::pair<td::string, td::string>> args) {
+  if (close_flag_) {
+    return promise.set_error(td::Status::Error(500, "Closing"));
+  }
+  td::string bot_filter;
+  for (auto &arg : args) {
+    if (arg.first == "bot") {
+      bot_filter = arg.second;
+    }
+  }
+
+  auto now = td::Time::now();
+  MetricsWriter writer;
+  const td::Slice counter("counter");
+  const td::Slice gauge("gauge");
+  if (bot_filter.empty()) {
+    writer.add("tgbotapi_uptime_seconds", gauge, "Time since the server start", td::Slice(),
+               now - parameters_->start_time_);
+    auto r_mem_stat = td::mem_stat();
+    if (r_mem_stat.is_ok()) {
+      auto mem_stat = r_mem_stat.move_as_ok();
+      writer.add("tgbotapi_process_resident_memory_bytes", gauge, "Resident memory size of the process", td::Slice(),
+                 static_cast<td::int64>(mem_stat.resident_size_));
+      writer.add("tgbotapi_process_virtual_memory_bytes", gauge, "Virtual memory size of the process", td::Slice(),
+                 static_cast<td::int64>(mem_stat.virtual_size_));
+    }
+#if TD_LINUX
+    auto r_cpu_stat = td::cpu_stat();
+    auto ticks_per_second = sysconf(_SC_CLK_TCK);
+    if (r_cpu_stat.is_ok() && ticks_per_second > 0) {
+      auto cpu_stat = r_cpu_stat.move_as_ok();
+      writer.add("tgbotapi_process_cpu_seconds_total", counter, "CPU time used by the process", "mode=\"user\"",
+                 static_cast<double>(cpu_stat.process_user_ticks_) / static_cast<double>(ticks_per_second));
+      writer.add("tgbotapi_process_cpu_seconds_total", counter, "CPU time used by the process", "mode=\"system\"",
+                 static_cast<double>(cpu_stat.process_system_ticks_) / static_cast<double>(ticks_per_second));
+    }
+#endif
+    writer.add("tgbotapi_buffer_memory_bytes", gauge, "Memory used by network buffers", td::Slice(),
+               static_cast<td::int64>(td::BufferAllocator::get_buffer_mem()));
+    writer.add("tgbotapi_active_requests", gauge, "Number of requests being processed", td::Slice(),
+               static_cast<td::int64>(parameters_->shared_data_->query_count_.load(std::memory_order_relaxed)));
+    writer.add("tgbotapi_active_network_queries", gauge, "Number of active queries to Telegram servers", td::Slice(),
+               static_cast<td::int64>(td::get_pending_network_query_count(*parameters_->net_query_stats_)));
+    writer.add("tgbotapi_webhook_connections", gauge, "Number of active webhook connections", td::Slice(),
+               static_cast<td::int64>(WebhookActor::get_total_connection_count()));
+    writer.add("tgbotapi_tqueue_expired_updates_total", counter,
+               "Number of updates deleted from the update queue after expiration", td::Slice(), tqueue_deleted_events_);
+    writer.add("tgbotapi_tdlib_restarts_total", counter, "Number of graceful restarts of TDLib instances", td::Slice(),
+               total_restart_count_);
+    writer.add("tgbotapi_tdlib_failed_restarts_total", counter,
+               "Number of cancelled graceful restarts of TDLib instances", td::Slice(), total_failed_restart_count_);
+    for (std::size_t reason = 0; reason < static_cast<std::size_t>(RejectReason::Size); reason++) {
+      writer.add("tgbotapi_rejected_requests_total", counter, "Number of requests, which weren't sent to a bot",
+                 PSLICE() << "reason=\"" << get_reject_reason_name(static_cast<RejectReason>(reason)) << '"',
+                 rejected_queries_[reason]);
+    }
+
+    td::int64 authorized_bot_count = 0;
+    td::int64 unauthorized_bot_count = 0;
+    td::FlatHashMap<td::int32, td::int64> unauthorized_bot_requests;
+    for (auto &it : unauthorized_bot_requests_) {
+      unauthorized_bot_requests[it.first] += it.second;
+    }
+    for (auto id : clients_.ids()) {
+      auto *client_info = clients_.get(id);
+      CHECK(client_info != nullptr);
+      if (client_info->was_authorized_) {
+        authorized_bot_count++;
+      } else {
+        unauthorized_bot_count++;
+        for (auto &it : client_info->metrics_->requests_) {
+          unauthorized_bot_requests[BotMetrics::decode_request_key(it.first).second.first] += it.second;
+        }
+      }
+    }
+    writer.add("tgbotapi_bots", gauge, "Number of bots", "state=\"authorized\"", authorized_bot_count);
+    writer.add("tgbotapi_bots", gauge, "Number of bots", "state=\"unauthorized\"", unauthorized_bot_count);
+    for (auto &it : unauthorized_bot_requests) {
+      writer.add("tgbotapi_unauthorized_bot_requests_total", counter,
+                 "Number of answered requests of bots, which were never authorized",
+                 PSLICE() << "code=\"" << it.first << '"', it.second);
+    }
+  }
+
+  for (auto id : clients_.ids()) {
+    auto *client_info = clients_.get(id);
+    CHECK(client_info != nullptr);
+    if (!client_info->was_authorized_) {
+      continue;
+    }
+    if (!bot_filter.empty()) {
+      auto bot_id = td::Slice(client_info->token_).substr(0, client_info->token_.find(':'));
+      if (bot_id != bot_filter) {
+        continue;
+      }
+    }
+    add_bot_metrics(writer, *client_info, now);
+  }
+
+  promise.set_value(td::BufferSlice(writer.finish()));
 }
 
 void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
@@ -867,6 +1205,7 @@ void ClientManager::raw_event(const td::Event::Raw &event) {
   CHECK(info->tqueue_id_ != 0);
   auto &value = active_client_count_[info->tqueue_id_];
   if (event.ptr != nullptr) {
+    info->was_authorized_ = true;
     value++;
   } else {
     CHECK(value > 0);
@@ -917,6 +1256,12 @@ void ClientManager::hangup_shared() {
   }
   if (restarting_client_id_ == id) {
     restarting_client_id_ = 0;
+  }
+  if (!info->was_authorized_ && info->metrics_ != nullptr) {
+    // per-bot metrics are exported only for authorized bots; keep totals of the others
+    for (auto &it : info->metrics_->requests_) {
+      unauthorized_bot_requests_[BotMetrics::decode_request_key(it.first).second.first] += it.second;
+    }
   }
 
   token_to_id_.erase(info->token_);

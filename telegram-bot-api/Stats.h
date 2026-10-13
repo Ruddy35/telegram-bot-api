@@ -6,6 +6,8 @@
 //
 #pragma once
 
+#include "telegram-bot-api/BotMetrics.h"
+
 #include "td/actor/actor.h"
 
 #include "td/utils/common.h"
@@ -13,6 +15,7 @@
 #include "td/utils/Time.h"
 #include "td/utils/TimedStat.h"
 
+#include <memory>
 #include <mutex>
 
 namespace telegram_bot_api {
@@ -108,6 +111,13 @@ struct ServerBotStat {
     size_t size_;
     td::int64 file_count_;
     td::int64 files_size_;
+
+    // for metrics
+    td::int32 method_id_ = 0;
+    td::int32 http_status_code_ = 0;
+    QueryFailReason fail_reason_ = QueryFailReason::None;
+    double duration_ = 0.0;
+    td::int64 query_size_ = 0;
   };
   void on_event(const Response &response) {
     response_count_++;
@@ -156,6 +166,7 @@ class BotStatActor final : public td::Actor {
     this->Actor::operator=(std::move(other));
     std::move(other.stat_, other.stat_ + SIZE, stat_);
     parent_ = other.parent_;
+    metrics_ = std::move(other.metrics_);
     return *this;
   }
   ~BotStatActor() final = default;
@@ -188,6 +199,10 @@ class BotStatActor final : public td::Actor {
 
   bool is_active(double now) const;
 
+  void set_metrics(std::shared_ptr<BotMetrics> metrics) {
+    metrics_ = std::move(metrics);
+  }
+
  private:
   static constexpr std::size_t SIZE = 4;
   static constexpr const char *DESCR[SIZE] = {"inf", "5sec", "1min", "1hour"};
@@ -195,6 +210,7 @@ class BotStatActor final : public td::Actor {
 
   td::TimedStat<ServerBotStat> stat_[SIZE];
   td::ActorId<BotStatActor> parent_;
+  std::shared_ptr<BotMetrics> metrics_;
   double last_activity_timestamp_ = -1e9;
   td::int64 active_request_count_ = 0;
   td::int64 active_file_upload_bytes_ = 0;
@@ -204,6 +220,11 @@ class BotStatActor final : public td::Actor {
   }
 
   void on_event(const ServerBotStat::Response &response) {
+    if (metrics_ != nullptr) {
+      metrics_->on_response(response.method_id_, response.http_status_code_, response.fail_reason_, response.duration_,
+                            response.query_size_, static_cast<td::int64>(response.size_), response.file_count_,
+                            response.files_size_);
+    }
     active_request_count_--;
     active_file_upload_count_ -= response.file_count_;
     active_file_upload_bytes_ -= response.files_size_;

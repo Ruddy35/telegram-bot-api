@@ -35,6 +35,10 @@ HOOK_PORT = 18083
 BUILD_DIR = None
 WORK_ROOT = None
 
+# answered API requests by (method, HTTP status code) for comparison with server metrics
+API_CALLS = collections.Counter()
+API_CALLS_LOCK = threading.Lock()
+
 
 def log(*args, **kwargs):
     print('[%.3f]' % (time.time() % 1000), *args, flush=True, **kwargs)
@@ -76,8 +80,50 @@ def api(method, timeout=60, **params):
     except urllib.error.HTTPError as e:
         result = json.loads(e.read())
     except OSError as e:
-        result = {'ok': False, 'description': str(e)}
+        return {'ok': False, 'description': str(e)}, time.time() - start
+    with API_CALLS_LOCK:
+        # the server counts requests to non-existing methods as requests to the method "unknown"
+        stat_method = 'unknown' if method == 'unknownMethod' else method.lower()
+        API_CALLS[(stat_method, 200 if result.get('ok') else result.get('error_code'))] += 1
     return result, time.time() - start
+
+
+def metrics():
+    """Returns server metrics as {(name, frozenset of labels): value}."""
+    with urllib.request.urlopen('http://127.0.0.1:%d/metrics' % STAT_PORT, timeout=10) as r:
+        text = r.read().decode()
+    result = {}
+    for line in text.splitlines():
+        if not line or line.startswith('#'):
+            continue
+        name_labels, value = line.rsplit(' ', 1)
+        labels = frozenset()
+        name = name_labels
+        if '{' in name_labels:
+            name, label_str = name_labels[:-1].split('{', 1)
+            labels = frozenset(tuple(item.split('=', 1)) for item in label_str.split('",'))
+            labels = frozenset((k, v.strip('"')) for k, v in labels)
+        result[(name, labels)] = float(value)
+    return result
+
+
+def metric_sum(values, name, **labels):
+    return sum(value for (metric_name, metric_labels), value in values.items()
+               if metric_name == name and all((k, str(v)) in metric_labels for k, v in labels.items()))
+
+
+def check_request_metrics():
+    """Checks that the server counted exactly the requests answered to the test."""
+    values = metrics()
+    with API_CALLS_LOCK:
+        calls = dict(API_CALLS)
+    for (method, code), count in sorted(calls.items()):
+        counted = metric_sum(values, 'tgbotapi_bot_requests_total', method=method, code=code)
+        assert counted == count, (method, code, count, counted)
+    total = metric_sum(values, 'tgbotapi_bot_requests_total')
+    assert total == sum(calls.values()), (total, sum(calls.values()))
+    log('metrics: %d answered requests are counted exactly' % total)
+    return values
 
 
 def stats(query=''):
@@ -105,6 +151,8 @@ def prepare(name, update_count):
 
 
 def start_server(work, *extra):
+    with API_CALLS_LOCK:
+        API_CALLS.clear()
     args = [os.path.join(BUILD_DIR, 'telegram-bot-api'), '--api-id=1', '--api-hash=test', '--local', '-p',
             str(API_PORT), '-s', str(STAT_PORT), '-d', work, '-l', os.path.join(work, 'log.txt'), '-v', '2'] + list(extra)
     log('start server with', ' '.join(extra))
@@ -204,6 +252,11 @@ def scenario_webhook():
         assert ids == list(range(ids[0], ids[0] + update_count)), 'lost updates'
         info, _ = api('getWebhookInfo')
         assert info['result']['pending_update_count'] == 0, info
+        time.sleep(0.5)  # wait for the last answers to be counted
+        values = check_request_metrics()
+        assert metric_sum(values, 'tgbotapi_bot_webhook_deliveries_total', result='ok') == update_count
+        assert metric_sum(values, 'tgbotapi_bot_tdlib_restarts_total') == 3
+        assert metric_sum(values, 'tgbotapi_tdlib_failed_restarts_total') == 0
     finally:
         stop_server(proc)
         hook.shutdown()
@@ -236,6 +289,10 @@ def scenario_polling():
         assert result['ok'] and result['result'] == [], result
         load.finish()
         assert got == list(range(got[0], got[0] + 50)), got
+        time.sleep(0.5)
+        values = check_request_metrics()
+        assert metric_sum(values, 'tgbotapi_bot_fetched_updates_total') == 50
+        assert metric_sum(values, 'tgbotapi_bot_tdlib_restarts_total') == 1
     finally:
         stop_server(proc)
 
@@ -257,6 +314,10 @@ def scenario_drain_timeout():
         load.finish()
         assert restart_count() == 0
         assert max(load.latencies) < 6, max(load.latencies)
+        values = metrics()
+        assert metric_sum(values, 'tgbotapi_tdlib_failed_restarts_total') == 1
+        assert metric_sum(values, 'tgbotapi_bot_requests_total', method='getme', code=200) == \
+            API_CALLS[('getme', 200)]
     finally:
         stop_server(proc)
 
@@ -293,13 +354,41 @@ def scenario_policy():
         stop_server(proc)
 
 
+def scenario_metrics():
+    """Failure reasons and requests abandoned by clients are counted."""
+    work = prepare('metrics', 3)
+    proc = start_server(work)
+    try:
+        assert api('getMe')[0]['ok']
+        assert api('unknownMethod')[0]['error_code'] == 404
+        assert api('setWebhook', url='http://127.0.0.1:%d/a' % HOOK_PORT)[0]['ok']
+        assert api('setWebhook', url='http://127.0.0.1:%d/b' % HOOK_PORT)[0]['error_code'] == 429
+        assert api('deleteWebhook')[0]['ok']
+        # requires network, so it is never answered; the client gives up after 1 second
+        result, _ = api('sendDocument', timeout=1, chat_id=123456789, document='https://example.com/file.pdf')
+        assert not result['ok'], result
+        result, _ = api('getUpdates')
+        assert len(result['result']) == 3, result
+        time.sleep(0.5)
+        values = check_request_metrics()
+        assert metric_sum(values, 'tgbotapi_bot_requests_total', method='setwebhook', code=429,
+                          reason='set_webhook_flood') == 1
+        assert metric_sum(values, 'tgbotapi_bot_requests_total', method='unknown', code=404) == 1
+        assert metric_sum(values, 'tgbotapi_bot_abandoned_requests_total', method='senddocument') == 1
+        assert metric_sum(values, 'tgbotapi_bot_input_files_total', method='senddocument', type='url') == 1
+        assert metric_sum(values, 'tgbotapi_bot_fetched_updates_total') == 3
+        assert metric_sum(values, 'tgbotapi_bots', state='authorized') == 1
+    finally:
+        stop_server(proc)
+
+
 def main():
     global BUILD_DIR, WORK_ROOT
     if len(sys.argv) < 2:
         print(__doc__ or 'Usage: restart_test.py <build dir> [scenario]...')
         sys.exit(1)
     BUILD_DIR = os.path.abspath(sys.argv[1])
-    scenarios = sys.argv[2:] or ['webhook', 'polling', 'drain_timeout', 'policy']
+    scenarios = sys.argv[2:] or ['webhook', 'polling', 'drain_timeout', 'policy', 'metrics']
     WORK_ROOT = tempfile.mkdtemp(prefix='telegram-bot-api-restart-test-')
     try:
         for scenario in scenarios:

@@ -37,7 +37,15 @@ class HttpConnection final : public td::HttpInboundConnection::Callback {
   td::ActorOwn<td::HttpInboundConnection> connection_;
   std::shared_ptr<SharedData> shared_data_;
 
+  // for metrics of requests abandoned by the client
+  td::string token_;
+  td::string method_;
+
   void hangup() final {
+    if (!connection_.empty() && !token_.empty()) {
+      // the connection was closed before an answer was sent
+      send_closure(client_manager_, &ClientManager::on_query_abandoned, std::move(token_), std::move(method_));
+    }
     connection_.release();
     stop();
   }

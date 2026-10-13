@@ -6,6 +6,7 @@
 //
 #pragma once
 
+#include "telegram-bot-api/BotMetrics.h"
 #include "telegram-bot-api/Query.h"
 #include "telegram-bot-api/Stats.h"
 #include "telegram-bot-api/WebhookActor.h"
@@ -44,7 +45,7 @@ class Client final : public WebhookActor::Callback {
  public:
   Client(td::ActorShared<> parent, const td::string &bot_token, bool is_test_dc, td::int64 tqueue_id,
          std::shared_ptr<const ClientParameters> parameters, td::ActorId<BotStatActor> stat_actor,
-         double first_start_time = 0.0);
+         std::shared_ptr<BotMetrics> metrics, double first_start_time = 0.0);
   Client(const Client &) = delete;
   Client &operator=(const Client &) = delete;
   Client(Client &&) = delete;
@@ -84,6 +85,33 @@ class Client final : public WebhookActor::Callback {
   td::int64 get_tdlib_update_count() const {
     return tdlib_update_count_;
   }
+
+  // for metrics
+  static td::int32 get_method_stat_id(td::Slice method);
+
+  static td::Slice get_method_stat_name(td::int32 method_id);
+
+  static td::int32 get_update_type_count();
+
+  static td::Slice get_update_type_stat_name(td::int32 update_type);
+
+  struct CacheStats {
+    std::size_t message_count = 0;
+    std::size_t user_count = 0;
+    std::size_t group_count = 0;
+    std::size_t supergroup_count = 0;
+    std::size_t chat_count = 0;
+    std::size_t community_count = 0;
+    std::size_t business_connection_count = 0;
+    std::size_t sticker_set_name_count = 0;
+    std::size_t pending_update_chat_count = 0;  // chats with partially handled updates
+    std::size_t active_download_count = 0;
+    std::size_t pending_send_message_count = 0;
+  };
+  CacheStats get_cache_stats() const;
+
+  // requests storage statistics from the TDLib instance and saves them to metrics
+  void update_storage_statistics();
 
  private:
   using int32 = td::int32;
@@ -304,6 +332,7 @@ class Client final : public WebhookActor::Callback {
 
   class TdOnOkCallback;
   class TdOnRestartNetworkTypeCallback;
+  class TdOnGetStorageStatisticsFastCallback;
   class TdOnAuthorizationCallback;
   class TdOnInitCallback;
   class TdOnGetUserProfilePhotosCallback;
@@ -1111,7 +1140,7 @@ class Client final : public WebhookActor::Callback {
   void do_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query);
 
   bool is_file_being_downloaded(int32 file_id) const;
-  void on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file);
+  void on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file, int64 partial_size = 0);
 
   void return_stickers(object_ptr<td_api::stickers> stickers, PromisedQueryPtr query);
 
@@ -1648,6 +1677,11 @@ class Client final : public WebhookActor::Callback {
 
   td::int64 tdlib_update_count_ = 0;
 
+  td::FlatHashSet<int32> cached_download_file_ids_;  // for metrics
+  bool is_storage_statistics_request_active_ = false;
+  static td::FlatHashMap<td::string, td::int32> method_stat_ids_;
+  static td::vector<td::string> method_stat_names_;
+
   td::ActorShared<> parent_;
   td::string bot_token_;
   td::string bot_token_with_dc_;
@@ -1850,6 +1884,8 @@ class Client final : public WebhookActor::Callback {
   int32 delayed_max_date_ = 0;
   int32 delayed_max_time_ = 0;
   size_t delayed_update_count_ = 0;
+
+  std::shared_ptr<BotMetrics> metrics_;
 
   std::shared_ptr<const ClientParameters> parameters_;
 

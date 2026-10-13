@@ -45,6 +45,8 @@ void HttpConnection::handle(td::unique_ptr<td::HttpQuery> http_query,
   }
 
   auto method = url_path_parser.data();
+  token_ = PSTRING() << token << (is_test_dc ? "/test" : "");
+  method_.clear();
   auto query = td::make_unique<Query>(std::move(http_query->container_), token, is_test_dc, method,
                                       std::move(http_query->args_), std::move(http_query->headers_),
                                       std::move(http_query->files_), shared_data_, http_query->peer_address_, false);
@@ -52,6 +54,7 @@ void HttpConnection::handle(td::unique_ptr<td::HttpQuery> http_query,
   auto promise = td::PromiseCreator::lambda([actor_id = actor_id(this)](td::Result<td::unique_ptr<Query>> r_query) {
     send_closure(actor_id, &HttpConnection::on_query_finished, std::move(r_query));
   });
+  method_ = query->method().str();
   auto promised_query = PromisedQueryPtr(query.release(), PromiseDeleter(std::move(promise)));
   send_closure(client_manager_, &ClientManager::send, std::move(promised_query));
 }
@@ -64,6 +67,7 @@ void HttpConnection::on_query_finished(td::Result<td::unique_ptr<Query>> r_query
 }
 
 void HttpConnection::send_response(int http_status_code, td::BufferSlice &&content, int retry_after) {
+  token_.clear();
   td::HttpHeaderCreator hc;
   hc.init_status_line(http_status_code);
   hc.set_keep_alive();

@@ -62,6 +62,7 @@ endif()
 set(TELEGRAM_BOT_API_SOURCE
   telegram-bot-api/telegram-bot-api.cpp
 
+  telegram-bot-api/BotMetrics.cpp
   telegram-bot-api/Client.cpp
   telegram-bot-api/ClientManager.cpp
   telegram-bot-api/HttpConnection.cpp
@@ -71,6 +72,7 @@ set(TELEGRAM_BOT_API_SOURCE
   telegram-bot-api/Watchdog.cpp
   telegram-bot-api/WebhookActor.cpp
 
+  telegram-bot-api/BotMetrics.h
   telegram-bot-api/Client.h
   telegram-bot-api/ClientManager.h
   telegram-bot-api/ClientParameters.h

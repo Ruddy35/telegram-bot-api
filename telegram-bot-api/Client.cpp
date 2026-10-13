@@ -24,6 +24,7 @@
 #include "td/utils/PathView.h"
 #include "td/utils/port/config.h"
 #include "td/utils/port/path.h"
+#include "td/utils/port/Stat.h"
 #include "td/utils/Slice.h"
 #include "td/utils/SliceBuilder.h"
 #include "td/utils/Span.h"
@@ -33,6 +34,7 @@
 #include "td/utils/Time.h"
 #include "td/utils/utf8.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <utility>
 
@@ -43,17 +45,19 @@ using td_api::move_object_as;
 
 Client::Client(td::ActorShared<> parent, const td::string &bot_token, bool is_test_dc, int64 tqueue_id,
                std::shared_ptr<const ClientParameters> parameters, td::ActorId<BotStatActor> stat_actor,
-               double first_start_time)
+               std::shared_ptr<BotMetrics> metrics, double first_start_time)
     : parent_(std::move(parent))
     , bot_token_(bot_token)
     , bot_token_id_("<unknown>")
     , is_test_dc_(is_test_dc)
     , tqueue_id_(tqueue_id)
     , first_start_time_(first_start_time)
+    , metrics_(std::move(metrics))
     , parameters_(std::move(parameters))
     , stat_actor_(std::move(stat_actor)) {
   static auto is_inited = init_methods();
   CHECK(is_inited);
+  CHECK(metrics_ != nullptr);
 }
 
 Client::~Client() {
@@ -77,7 +81,7 @@ void Client::fail_query_with_error(PromisedQueryPtr query, int32 error_code, td:
   if (error_code == 429) {
     auto retry_after_time = get_retry_after_time(error_message);
     if (retry_after_time > 0) {
-      return query->set_retry_after_error(retry_after_time);
+      return query->set_retry_after_error(retry_after_time, QueryFailReason::TelegramFlood);
     }
     LOG(ERROR) << "Wrong error message: " << error_message << " from " << *query;
     return fail_query(500, error_message, std::move(query));
@@ -406,7 +410,65 @@ bool Client::init_methods() {
   methods_.emplace("deletewebhook", &Client::process_set_webhook_query);
   methods_.emplace("getwebhookinfo", &Client::process_get_webhook_info_query);
   methods_.emplace("getfile", &Client::process_get_file_query);
+
+  // method identifiers for metrics; 0 is used for unknown methods
+  method_stat_names_.push_back("unknown");
+  td::vector<td::string> method_names;
+  for (auto &method : methods_) {
+    method_names.push_back(method.first);
+  }
+  method_names.push_back("close");
+  method_names.push_back("logout");
+  std::sort(method_names.begin(), method_names.end());
+  for (auto &method_name : method_names) {
+    method_stat_ids_.emplace(method_name, static_cast<td::int32>(method_stat_names_.size()));
+    method_stat_names_.push_back(method_name);
+  }
   return true;
+}
+
+td::int32 Client::get_method_stat_id(td::Slice method) {
+  auto it = method_stat_ids_.find(method.str());
+  if (it == method_stat_ids_.end()) {
+    return 0;
+  }
+  return it->second;
+}
+
+td::Slice Client::get_method_stat_name(td::int32 method_id) {
+  if (method_id <= 0 || static_cast<std::size_t>(method_id) >= method_stat_names_.size()) {
+    return td::Slice("unknown");
+  }
+  return method_stat_names_[method_id];
+}
+
+td::int32 Client::get_update_type_count() {
+  return static_cast<td::int32>(UpdateType::Size);
+}
+
+td::Slice Client::get_update_type_stat_name(td::int32 update_type) {
+  if (update_type < 0 || update_type >= get_update_type_count()) {
+    return td::Slice("unknown");
+  }
+  return get_update_type_name(static_cast<UpdateType>(update_type));
+}
+
+Client::CacheStats Client::get_cache_stats() const {
+  CacheStats result;
+  result.message_count = messages_.calc_size();
+  result.user_count = users_.calc_size();
+  result.group_count = groups_.calc_size();
+  result.supergroup_count = supergroups_.calc_size();
+  result.chat_count = chats_.calc_size();
+  result.community_count = communities_.calc_size();
+  result.business_connection_count = business_connections_.calc_size();
+  result.sticker_set_name_count = sticker_set_names_.calc_size();
+  result.pending_update_chat_count = new_message_queues_.size() + new_business_message_queues_.size() +
+                                     new_guest_query_queues_.size() + new_callback_query_queues_.size() +
+                                     new_business_callback_query_queues_.size();
+  result.active_download_count = file_download_listeners_.size();
+  result.pending_send_message_count = pending_send_message_queries_.size();
+  return result;
 }
 
 bool Client::is_local_method(td::Slice method) {
@@ -6756,6 +6818,26 @@ class Client::TdOnRestartNetworkTypeCallback final : public TdQueryCallback {
   td::uint64 restart_generation_;
 };
 
+class Client::TdOnGetStorageStatisticsFastCallback final : public TdQueryCallback {
+ public:
+  explicit TdOnGetStorageStatisticsFastCallback(Client *client) : client_(client) {
+  }
+
+  void on_result(object_ptr<td_api::Object> result) final {
+    client_->is_storage_statistics_request_active_ = false;
+    if (result->get_id() == td_api::error::ID) {
+      return;
+    }
+    CHECK(result->get_id() == td_api::storageStatisticsFast::ID);
+    auto statistics = move_object_as<td_api::storageStatisticsFast>(result);
+    client_->metrics_->set_storage_statistics(statistics->files_size_, statistics->file_count_,
+                                              statistics->database_size_, statistics->log_size_);
+  }
+
+ private:
+  Client *client_;
+};
+
 class Client::TdOnAuthorizationCallback final : public TdQueryCallback {
  public:
   explicit TdOnAuthorizationCallback(Client *client) : client_(client) {
@@ -7588,10 +7670,17 @@ class Client::TdOnDownloadFileCallback final : public TdQueryCallback {
       return client_->on_file_download(file_id_, td::Status::Error(error->code_, error->message_));
     }
     CHECK(result->get_id() == td_api::file::ID);
+    auto file = move_object_as<td_api::file>(result);
     if (client_->is_file_being_downloaded(file_id_)) {  // if download is yet not finished
-      client_->download_started_file_ids_.insert(file_id_);
+      if (client_->download_started_file_ids_.insert(file_id_).second) {
+        if (file->local_->is_downloading_completed_) {
+          client_->cached_download_file_ids_.insert(file_id_);
+        } else {
+          client_->metrics_->on_download_started();
+        }
+      }
     }
-    client_->on_update_file(move_object_as<td_api::file>(result));
+    client_->on_update_file(std::move(file));
   }
 
  private:
@@ -8727,6 +8816,16 @@ void Client::cancel_restart(td::Slice reason) {
   restart_promise_.set_error(td::Status::Error(500, reason));
 }
 
+void Client::update_storage_statistics() {
+  if (td_client_.empty() || !was_authorized_ || closing_ || logging_out_ || is_restart_in_progress() ||
+      is_storage_statistics_request_active_) {
+    return;
+  }
+  is_storage_statistics_request_active_ = true;
+  do_send_request(make_object<td_api::getStorageStatisticsFast>(),
+                  td::make_unique<TdOnGetStorageStatisticsFastCallback>(this));
+}
+
 void Client::log_out(int32 error_code, td::Slice error_message) {
   LOG(WARNING) << "Logging out due to error " << error_code << ": " << error_message;
   if (error_message == "API_ID_INVALID") {
@@ -8865,6 +8964,7 @@ void Client::send_delayed(PromisedQueryPtr query) {
 
 void Client::do_send(PromisedQueryPtr query, bool check_flood_limits) {
   if (!query->is_internal()) {
+    query->set_stat_method_id(get_method_stat_id(query->method()));
     query->set_stat_actor(stat_actor_);
     if (check_flood_limits && !parameters_->local_mode_ && !is_local_method(query->method()) &&
         td::Time::now() > parameters_->start_time_ + 60) {
@@ -9612,7 +9712,8 @@ void Client::on_update_file(object_ptr<td_api::file> file) {
       send_request(make_object<td_api::cancelDownloadFile>(file_id, false),
                    td::make_unique<TdOnCancelDownloadFileCallback>());
     }
-    return on_file_download(file_id, td::Status::Error(400, "Bad Request: file is too big"));
+    return on_file_download(file_id, td::Status::Error(400, "Bad Request: file is too big"),
+                            file->local_->downloaded_size_);
   }
   if (file->local_->is_downloading_completed_) {
     return on_file_download(file_id, std::move(file));
@@ -9621,11 +9722,11 @@ void Client::on_update_file(object_ptr<td_api::file> file) {
     // also includes all 5xx and 429 errors
     if (closing_ || logging_out_) {
       auto error = get_closing_error();
-      return on_file_download(file_id, td::Status::Error(error.code, error.message));
+      return on_file_download(file_id, td::Status::Error(error.code, error.message), file->local_->downloaded_size_);
     }
 
     auto error = td::Status::Error(400, "Bad Request: wrong file_id or the file is temporarily unavailable");
-    return on_file_download(file_id, std::move(error));
+    return on_file_download(file_id, std::move(error), file->local_->downloaded_size_);
   }
 }
 
@@ -9755,6 +9856,7 @@ void Client::update_shared_unix_time_difference() {
 
 void Client::on_update(object_ptr<td_api::Object> result) {
   tdlib_update_count_++;
+  metrics_->on_tdlib_update();
   if (!was_authorized_ && !allow_update_before_authorization(result.get())) {
     pending_updates_.push_back(std::move(result));
     return;
@@ -10243,11 +10345,13 @@ void Client::on_closed() {
     LOG(ERROR) << "Doesn't receive updateFile for file " << file_id;
     auto queries = std::move(it->second);
     file_download_listeners_.erase(it);
+    metrics_->on_download_finished(BotMetrics::DownloadResult::Aborted, 0);
     for (auto &query : queries) {
       fail_query_closing(std::move(query));
     }
   }
   download_started_file_ids_.clear();
+  cached_download_file_ids_.clear();
 
   if (logging_out_) {
     parameters_->shared_data_->webhook_db_->erase(bot_token_with_dc_);
@@ -11038,7 +11142,11 @@ td_api::object_ptr<td_api::InputFile> Client::get_input_file(const Query *query,
     if (parameters_->local_mode_) {
       td::Slice file_protocol{"file:/"};
       if (td::begins_with(file_id, file_protocol)) {
-        return make_object<td_api::inputFileLocal>(get_local_file_path(file_id.substr(file_protocol.size())));
+        auto path = get_local_file_path(file_id.substr(file_protocol.size()));
+        auto r_stat = td::stat(path);
+        metrics_->on_input_file(query->get_stat_method_id(), BotMetrics::InputFileType::LocalPath,
+                                r_stat.is_ok() ? r_stat.ok().size_ : 0);
+        return make_object<td_api::inputFileLocal>(std::move(path));
       }
     }
     td::Slice attach_protocol{"attach://"};
@@ -11046,12 +11154,18 @@ td_api::object_ptr<td_api::InputFile> Client::get_input_file(const Query *query,
       field_name = file_id.substr(attach_protocol.size());
     } else {
       if (!force_file) {
+        // the same check as in TDLib: identifiers containing '.' are treated as HTTP URLs
+        metrics_->on_input_file(
+            query->get_stat_method_id(),
+            file_id.find('.') != td::Slice::npos ? BotMetrics::InputFileType::Url : BotMetrics::InputFileType::FileId,
+            0);
         return make_object<td_api::inputFileRemote>(file_id.str());
       }
     }
   }
   auto file = query->file(field_name);
   if (file != nullptr) {
+    metrics_->on_input_file(query->get_stat_method_id(), BotMetrics::InputFileType::Upload, file->size);
     return make_object<td_api::inputFileLocal>(file->temp_file_name);
   }
 
@@ -13995,7 +14109,7 @@ void Client::on_cmd(PromisedQueryPtr query, bool force) {
     if (query->method() == "close") {
       auto retry_after = static_cast<int>(10 * 60 - (td::Time::now() - first_start_time_));
       if (retry_after > 0 && first_start_time_ > parameters_->start_time_ + 10 * 60) {
-        return query->set_retry_after_error(retry_after);
+        return query->set_retry_after_error(retry_after, QueryFailReason::CloseFlood);
       }
       need_close_ = true;
       return do_send_request(make_object<td_api::close>(), td::make_unique<TdOnOkQueryCallback>(std::move(query)));
@@ -17215,7 +17329,7 @@ td::Status Client::process_set_webhook_query(PromisedQueryPtr &query) {
   auto now = td::Time::now_cached();
   if (!new_url.empty() && !query->is_internal()) {
     if (now < next_allowed_set_webhook_time_) {
-      query->set_retry_after_error(1);
+      query->set_retry_after_error(1, QueryFailReason::WebhookChangeFlood);
       return td::Status::OK();
     }
     next_allowed_set_webhook_time_ = now + 1;
@@ -17236,7 +17350,7 @@ td::Status Client::process_set_webhook_query(PromisedQueryPtr &query) {
     // already updating webhook. Cancel previous request
     fail_query_conflict("Conflict: terminated by other setWebhook", std::move(webhook_set_query_));
   } else if (active_webhook_set_query_) {
-    query->set_retry_after_error(1);
+    query->set_retry_after_error(1, QueryFailReason::WebhookChangeFlood);
     return td::Status::OK();
   } else if (webhook_url_ == new_url && !has_webhook_certificate_ && !new_has_certificate &&
              new_max_connections == webhook_max_connections_ && new_fix_ip_address == webhook_fix_ip_address_ &&
@@ -17297,6 +17411,7 @@ td::Status Client::process_get_file_query(PromisedQueryPtr &query) {
 void Client::do_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query) {
   if (!parameters_->local_mode_ &&
       td::max(file->expected_size_, file->local_->downloaded_size_) > MAX_DOWNLOAD_FILE_SIZE) {  // speculative check
+    metrics_->on_download_finished(BotMetrics::DownloadResult::TooBig, 0);
     return fail_query(400, "Bad Request: file is too big", std::move(query));
   }
 
@@ -17310,7 +17425,7 @@ bool Client::is_file_being_downloaded(int32 file_id) const {
   return file_download_listeners_.count(file_id) > 0;
 }
 
-void Client::on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file) {
+void Client::on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file, int64 partial_size) {
   auto it = file_download_listeners_.find(file_id);
   if (it == file_download_listeners_.end()) {
     return;
@@ -17318,6 +17433,19 @@ void Client::on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>
   auto queries = std::move(it->second);
   file_download_listeners_.erase(it);
   download_started_file_ids_.erase(file_id);
+  bool is_cached = cached_download_file_ids_.erase(file_id) > 0;
+  if (r_file.is_ok()) {
+    const auto &file = r_file.ok();
+    metrics_->on_download_finished(
+        is_cached ? BotMetrics::DownloadResult::Cached : BotMetrics::DownloadResult::Completed,
+        td::max(file->size_, file->local_->downloaded_size_));
+  } else if (closing_ || logging_out_) {
+    metrics_->on_download_finished(BotMetrics::DownloadResult::Closing, partial_size);
+  } else if (td::begins_with(r_file.error().message(), "Bad Request: file is too big")) {
+    metrics_->on_download_finished(BotMetrics::DownloadResult::TooBig, partial_size);
+  } else {
+    metrics_->on_download_finished(BotMetrics::DownloadResult::Error, partial_size);
+  }
   for (auto &query : queries) {
     if (r_file.is_error()) {
       const auto &error = r_file.error();
@@ -17508,7 +17636,7 @@ void Client::do_set_webhook(PromisedQueryPtr query, bool was_deleted) {
 
     if (active_webhook_set_query_) {
       // shouldn't happen, unless the active setWebhook request took more than 1 second
-      return query->set_retry_after_error(1);
+      return query->set_retry_after_error(1, QueryFailReason::WebhookChangeFlood);
     }
 
     CHECK(!has_webhook_certificate_);
@@ -17579,7 +17707,7 @@ void Client::finish_set_webhook(PromisedQueryPtr query) {
   webhook_id_ = td::create_actor<WebhookActor>(
       webhook_actor_name, actor_shared(this, webhook_generation_), tqueue_id_, url.move_as_ok(),
       has_webhook_certificate_ ? get_webhook_certificate_path() : td::string(), webhook_max_connections_,
-      query->is_internal(), webhook_ip_address_, webhook_fix_ip_address_, webhook_secret_token_, parameters_);
+      query->is_internal(), webhook_ip_address_, webhook_fix_ip_address_, webhook_secret_token_, parameters_, metrics_);
   // wait for webhook verified or webhook callback
   webhook_query_type_ = WebhookQueryType::Verify;
   CHECK(!active_webhook_set_query_);
@@ -17775,6 +17903,7 @@ void Client::fail_query_conflict(td::CSlice message, PromisedQueryPtr &&query) {
 }
 
 void Client::fail_query_closing(PromisedQueryPtr &&query) {
+  query->set_fail_reason(QueryFailReason::Closing);
   auto error = get_closing_error();
   if (error.retry_after > 0) {
     query->set_retry_after_error(error.retry_after);
@@ -17787,8 +17916,9 @@ void Client::fail_query_flood_limit_exceeded(PromisedQueryPtr &&query) {
   flood_limited_query_count_++;
   td::create_actor<td::SleepActor>(
       "FailQueryFloodLimitExceededActor", 3.0,
-      td::PromiseCreator::lambda(
-          [query = std::move(query)](td::Result<td::Unit> result) mutable { query->set_retry_after_error(60); }))
+      td::PromiseCreator::lambda([query = std::move(query)](td::Result<td::Unit> result) mutable {
+        query->set_retry_after_error(60, QueryFailReason::ServerFlood);
+      }))
       .release();
 }
 
@@ -17924,6 +18054,7 @@ void Client::do_get_updates(int32 offset, int32 limit, int32 timeout, PromisedQu
     send_request(make_object<td_api::setBotUpdatesStatus>(0, ""), td::make_unique<TdOnOkCallback>());
     was_bot_updates_warning_ = false;
   }
+  metrics_->on_updates_fetched(static_cast<td::int64>(updates.size()));
   answer_query(JsonUpdates(updates), std::move(query));
 }
 
@@ -18649,6 +18780,7 @@ void Client::add_update_impl(UpdateType update_type, const td::VirtuallyJsonable
   if (((allowed_update_types_ >> static_cast<int32>(update_type)) & 1) == 0) {
     LOG(DEBUG) << "Skip disallowed update of the type " << static_cast<int32>(update_type)
                << ", allowed update mask is " << allowed_update_types_;
+    metrics_->on_update(static_cast<int32>(update_type), BotMetrics::UpdateResult::Filtered);
     return;
   }
 
@@ -18662,6 +18794,7 @@ void Client::add_update_impl(UpdateType update_type, const td::VirtuallyJsonable
   jb.enter_value() << update;
   if (jb.string_builder().is_error()) {
     LOG(ERROR) << "JSON buffer overflow";
+    metrics_->on_update(static_cast<int32>(update_type), BotMetrics::UpdateResult::Failed);
     return;
   }
 
@@ -18669,6 +18802,7 @@ void Client::add_update_impl(UpdateType update_type, const td::VirtuallyJsonable
   auto r_id = parameters_->shared_data_->tqueue_->push(tqueue_id_, update_slice.str(), get_unix_time() + timeout,
                                                        webhook_queue_id, td::TQueue::EventId());
   if (r_id.is_ok()) {
+    metrics_->on_update(static_cast<int32>(update_type), BotMetrics::UpdateResult::Queued);
     auto id = r_id.move_as_ok();
     LOG(DEBUG) << "Update " << id << " was added for " << timeout << " seconds: " << update_slice;
     if (webhook_url_.empty()) {
@@ -18679,6 +18813,7 @@ void Client::add_update_impl(UpdateType update_type, const td::VirtuallyJsonable
   } else {
     LOG(DEBUG) << "Update failed to be added with error " << r_id.error() << " for " << timeout
                << " seconds: " << update_slice;
+    metrics_->on_update(static_cast<int32>(update_type), BotMetrics::UpdateResult::Failed);
   }
 }
 
@@ -20289,5 +20424,7 @@ bool Client::is_topic_message(const object_ptr<td_api::MessageTopic> &topic_id) 
 }
 
 td::FlatHashMap<td::string, td::Status (Client::*)(PromisedQueryPtr &query)> Client::methods_;
+td::FlatHashMap<td::string, td::int32> Client::method_stat_ids_;
+td::vector<td::string> Client::method_stat_names_;
 
 }  // namespace telegram_bot_api

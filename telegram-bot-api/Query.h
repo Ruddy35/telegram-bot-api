@@ -6,6 +6,7 @@
 //
 #pragma once
 
+#include "telegram-bot-api/BotMetrics.h"
 #include "telegram-bot-api/ClientParameters.h"
 
 #include "td/net/HttpFile.h"
@@ -98,7 +99,20 @@ class Query final : public td::ListNode {
 
   void set_error(int http_status_code, td::BufferSlice result);
 
-  void set_retry_after_error(int retry_after);
+  void set_retry_after_error(int retry_after, QueryFailReason fail_reason = QueryFailReason::None);
+
+  // for metrics
+  void set_stat_method_id(td::int32 method_id) {
+    stat_method_id_ = method_id;
+  }
+
+  void set_fail_reason(QueryFailReason fail_reason) {
+    fail_reason_ = fail_reason;
+  }
+
+  td::int32 get_stat_method_id() const {
+    return stat_method_id_;
+  }
 
   bool is_ready() const {
     return state_ != State::Query;
@@ -139,6 +153,8 @@ class Query final : public td::ListNode {
   double start_timestamp_;
   td::IPAddress peer_ip_address_;
   td::ActorId<BotStatActor> stat_actor_;
+  td::int32 stat_method_id_ = 0;
+  QueryFailReason fail_reason_ = QueryFailReason::None;
 
   // request
   td::vector<td::BufferSlice> container_;
@@ -239,7 +255,7 @@ class PromiseDeleter {
     td::unique_ptr<Query> query(raw_ptr);  // now I cannot forget to delete this pointer
     if (promise_) {
       if (!query->is_ready()) {
-        query->set_retry_after_error(5);
+        query->set_retry_after_error(5, QueryFailReason::Dropped);
       }
 
       promise_.set_value(std::move(query));

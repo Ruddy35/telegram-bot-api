@@ -14,6 +14,7 @@ Please note that only global Bot API issues that affect all bots are suitable fo
 - [Moving a bot to a local server](#switching)
 - [Moving a bot from one local server to another](#moving)
 - [Releasing memory of TDLib instances](#memory)
+- [Per-bot metrics](#metrics)
 - [License](#license)
 
 <a name="installation"></a>
@@ -114,6 +115,15 @@ affected.
 * `GET http://<stat address>:<stat port>/?restart=<bot_id>|all` - request a restart manually.
 
 See [MEMORY.md](MEMORY.md) for details (in Russian).
+
+<a name="metrics"></a>
+## Per-bot metrics
+
+`GET http://<stat address>:<stat port>/metrics` returns metrics in the Prometheus text format for VictoriaMetrics or
+Prometheus: requests by method, HTTP status code and failure reason, answer time, request and answer sizes, requests
+abandoned by clients, files sent by upload, local path, file_id or URL, file downloads by result, updates by type,
+webhook deliveries, disk usage, Bot API cache sizes and graceful restarts of TDLib instances of each bot.
+`?bot=<bot_id>` limits the output to a single bot. See [METRICS.md](METRICS.md) for details (in Russian).
 
 <a name="license"></a>
 ## License
