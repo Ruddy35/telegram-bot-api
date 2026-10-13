@@ -100,13 +100,11 @@ void BotMetrics::set_tdlib_object_counts(td::vector<std::pair<td::string, td::in
   tdlib_object_counts_ = std::move(object_counts);
 }
 
-void BotMetrics::set_storage_statistics(td::int64 files_size, td::int64 file_count, td::int64 database_size,
-                                        td::int64 log_size) {
+void BotMetrics::set_storage_statistics(td::int64 files_size, td::int64 file_count, td::int64 database_size) {
   has_storage_statistics_ = true;
   storage_files_size_ = files_size;
   storage_file_count_ = file_count;
   storage_database_size_ = database_size;
-  storage_log_size_ = log_size;
 }
 
 namespace {

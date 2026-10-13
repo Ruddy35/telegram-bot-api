@@ -142,8 +142,8 @@ class ClientManager final : public td::Actor {
   static td::Slice get_reject_reason_name(RejectReason reason);
   std::array<td::int64, static_cast<std::size_t>(RejectReason::Size)> rejected_queries_{};
   td::FlatHashMap<td::int32, td::int64> unauthorized_bot_requests_;  // HTTP status code -> count; for removed bots
-  double next_tdlib_statistics_time_ = 0.0;
-  static constexpr double TDLIB_STATISTICS_PERIOD = 60.0;
+  td::uint64 tdlib_statistics_check_count_ = 0;
+  static constexpr td::uint64 TDLIB_STATISTICS_PERIOD = 60;  // in RESTART_CHECK_PERIOD
 
   void add_bot_metrics(MetricsWriter &writer, const ClientInfo &client_info, double now);
 

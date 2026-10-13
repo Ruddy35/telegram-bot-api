@@ -6833,8 +6833,9 @@ class Client::TdOnGetStorageStatisticsFastCallback final : public TdQueryCallbac
     }
     CHECK(result->get_id() == td_api::storageStatisticsFast::ID);
     auto statistics = move_object_as<td_api::storageStatisticsFast>(result);
+    // log_size is the size of the log of the whole server, so it isn't used
     client_->metrics_->set_storage_statistics(statistics->files_size_, statistics->file_count_,
-                                              statistics->database_size_, statistics->log_size_);
+                                              statistics->database_size_);
   }
 
  private:

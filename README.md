@@ -129,6 +129,7 @@ and graceful restarts of TDLib instances of each bot.
 CPU time of each bot is estimated by sampling: each thread is interrupted with `SIGPROF` after every 10 milliseconds of
 its CPU time and the current actor context is remembered. Use `--cpu-sampling-rate` to change the number of samples
 per second of CPU time or `--cpu-sampling-rate=0` to disable the sampling. The sampling is supported only on Linux.
+Disable the sampling to use other profilers based on `SIGPROF`, for example, gperftools or gprof.
 
 Numbers of objects in memory require a small patch of TDLib from [td-patches](td-patches/README.md), which is applied
 automatically by CMake, so `git` is needed to build the server.

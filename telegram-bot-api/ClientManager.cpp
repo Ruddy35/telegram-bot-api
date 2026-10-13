@@ -214,14 +214,17 @@ void ClientManager::on_restart_check_timer() {
   auto now = td::Time::now();
   check_restarts(now);
 
-  if (now >= next_tdlib_statistics_time_) {
-    next_tdlib_statistics_time_ = now + TDLIB_STATISTICS_PERIOD;
-    for (auto id : clients_.ids()) {
-      auto *client_info = clients_.get(id);
-      CHECK(client_info != nullptr);
-      if (!client_info->client_.empty() && client_info->was_authorized_) {
-        send_closure(client_info->client_, &Client::update_tdlib_statistics);
-      }
+  // statistics of each bot are updated once in TDLIB_STATISTICS_PERIOD checks; requests of different bots are spread
+  // over the period to avoid bursts of requests to the thread of TDLib instances
+  tdlib_statistics_check_count_++;
+  for (auto id : clients_.ids()) {
+    if ((id + tdlib_statistics_check_count_) % TDLIB_STATISTICS_PERIOD != 0) {
+      continue;
+    }
+    auto *client_info = clients_.get(id);
+    CHECK(client_info != nullptr);
+    if (!client_info->client_.empty() && client_info->was_authorized_) {
+      send_closure(client_info->client_, &Client::update_tdlib_statistics);
     }
   }
 
@@ -700,8 +703,6 @@ void ClientManager::add_bot_metrics(MetricsWriter &writer, const ClientInfo &cli
                PSLICE() << bot_label << ",type=\"files\"", metrics.storage_files_size_);
     writer.add("tgbotapi_bot_storage_bytes", gauge, "Size of files and databases of the bot on the disk",
                PSLICE() << bot_label << ",type=\"database\"", metrics.storage_database_size_);
-    writer.add("tgbotapi_bot_storage_bytes", gauge, "Size of files and databases of the bot on the disk",
-               PSLICE() << bot_label << ",type=\"log\"", metrics.storage_log_size_);
     writer.add("tgbotapi_bot_storage_files", gauge, "Number of files of the bot on the disk", bot_label,
                metrics.storage_file_count_);
   }

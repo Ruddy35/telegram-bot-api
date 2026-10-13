@@ -5,10 +5,10 @@
 
 | Патч | Что делает |
 |---|---|
-| `0001-memory-object-counts.patch` | Метод `getMemoryObjectCounts`: число файлов, чатов, сообщений, пользователей, медиа и т. п. в памяти инстанса. Разрешает ботам `getStorageStatisticsFast`. Нужен для метрик `tgbotapi_bot_tdlib_objects` и `tgbotapi_bot_storage_*` (`METRICS.md`) |
+| `0001-memory-object-counts.patch` | Метод `getMemoryObjectCounts`: число файлов, чатов, сообщений, пользователей, медиа и т. п. в памяти инстанса. Разрешает ботам `getStorageStatisticsFast`. Нужен для метрик `tgbotapi_bot_tdlib_objects` и `tgbotapi_bot_storage_*` (`METRICS.md`). `log_size` в ответе `getStorageStatisticsFast` — размер общего лога сервера, поэтому в метрики бота он не попадает |
 
-Патч только читает размеры контейнеров и ведёт один счётчик загруженных сообщений. Поведение TDLib
-он не меняет.
+Патч только читает размеры контейнеров и ведёт один счётчик загруженных сообщений. Кроме
+разрешения `getStorageStatisticsFast` для ботов, поведение TDLib он не меняет.
 
 ## Как применяется
 
@@ -18,12 +18,19 @@ CMake на этапе конфигурации применяет каждый `
 
 После этого `git status` показывает submodule `td` как изменённый — так и должно быть.
 
-Нужен `git`. Если его нет в окружении сборки, примените патчи вручную и передайте CMake
+Нужен `git`. Патчи применяются через отдельный пустой git-каталог в каталоге сборки, поэтому
+работают одинаково, если `td` — submodule, обычная папка или копия без родительского `.git`
+(например, после `COPY .` в Docker).
+
+Если `git` в окружении сборки нет, примените патчи вручную и передайте CMake
 `-DTELEGRAM_BOT_API_APPLY_TD_PATCHES=OFF`:
 
 ```
-cd td && git apply ../td-patches/*.patch
+cd td && for p in ../td-patches/*.patch; do patch -p1 < "$p"; done
 ```
+
+Патчи проверяются только при запуске CMake. Если откатить изменения в `td/`, запустите CMake
+снова, иначе сборка упадёт на отсутствующем `getMemoryObjectCounts`.
 
 ## Обновление TDLib
 

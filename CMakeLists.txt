@@ -14,10 +14,18 @@ if (TELEGRAM_BOT_API_APPLY_TD_PATCHES)
                           "pass -DTELEGRAM_BOT_API_APPLY_TD_PATCHES=OFF to CMake.")
     endif()
   endif()
+  # an empty private repository is used, so the patches are applied in the same way whether td is a submodule,
+  # a plain directory inside another repository, or a copy with a broken .git link
+  set(TD_PATCHES_GIT_DIR "${CMAKE_CURRENT_BINARY_DIR}/td-patches-git")
+  if (TD_PATCHES AND NOT EXISTS "${TD_PATCHES_GIT_DIR}/HEAD")
+    execute_process(COMMAND "${GIT_EXECUTABLE}" init --quiet --bare "${TD_PATCHES_GIT_DIR}"
+                    RESULT_VARIABLE TD_PATCHES_GIT_INIT_RESULT)
+    if (NOT TD_PATCHES_GIT_INIT_RESULT EQUAL 0)
+      message(FATAL_ERROR "Failed to create ${TD_PATCHES_GIT_DIR}")
+    endif()
+  endif()
+  set(TD_GIT_APPLY "${GIT_EXECUTABLE}" "--git-dir=${TD_PATCHES_GIT_DIR}" --work-tree=. apply --whitespace=nowarn)
   foreach (TD_PATCH ${TD_PATCHES})
-    # GIT_CEILING_DIRECTORIES prevents applying the patch relative to the Bot API repository if td isn't a repository
-    set(TD_GIT_APPLY "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_SOURCE_DIR}"
-                     "${GIT_EXECUTABLE}" apply --whitespace=nowarn)
     execute_process(COMMAND ${TD_GIT_APPLY} --reverse --check "${TD_PATCH}"
                     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/td"
                     RESULT_VARIABLE TD_PATCH_IS_APPLIED OUTPUT_QUIET ERROR_QUIET)

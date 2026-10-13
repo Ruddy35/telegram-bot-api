@@ -2,7 +2,7 @@ Patch of TDLib sources needed by the Bot API server metrics.
 
 - Adds the method getMemoryObjectCounts, which returns numbers of objects of different types stored in memory by
   a TDLib instance, which are never deleted from memory, or are deleted only after some time.
-  The counts are calculated in constant time, except for the number of loaded messages, which is maintained by
+  The counts are calculated without iterating over the containers; the number of loaded messages is maintained by
   MessagesManager in loaded_message_count_.
 - Allows bots to use getStorageStatisticsFast.
 

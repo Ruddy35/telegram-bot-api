@@ -67,7 +67,7 @@ class BotMetrics {
 
   void on_tdlib_update();
 
-  void set_storage_statistics(td::int64 files_size, td::int64 file_count, td::int64 database_size, td::int64 log_size);
+  void set_storage_statistics(td::int64 files_size, td::int64 file_count, td::int64 database_size);
 
   void set_tdlib_object_counts(td::vector<std::pair<td::string, td::int64>> object_counts);
 
@@ -141,7 +141,6 @@ class BotMetrics {
   td::int64 storage_files_size_ = 0;
   td::int64 storage_file_count_ = 0;
   td::int64 storage_database_size_ = 0;
-  td::int64 storage_log_size_ = 0;
 
   // numbers of objects in memory of the current TDLib instance by type
   td::vector<std::pair<td::string, td::int64>> tdlib_object_counts_;
