@@ -10,7 +10,7 @@
 #
 # Usage:
 #   cmake --build <build dir> --target telegram-bot-api restart-test-fake-auth restart-test-fake-updates
-#   python3 test/restart/restart_test.py <build dir> [webhook] [polling] [drain_timeout] [policy]
+#   python3 test/restart/restart_test.py <build dir> [webhook] [polling] [drain_timeout] [policy] [metrics] [resources]
 #
 import collections
 import json
@@ -382,13 +382,81 @@ def scenario_metrics():
         stop_server(proc)
 
 
+def check_cpu_metrics(values):
+    """Checks that CPU time of all threads is attributed either to bots or to the server."""
+    client = metric_sum(values, 'tgbotapi_bot_cpu_seconds_total', part='client')
+    tdlib = metric_sum(values, 'tgbotapi_bot_cpu_seconds_total', part='tdlib')
+    unattributed = metric_sum(values, 'tgbotapi_cpu_unattributed_seconds_total')
+    threads = metric_sum(values, 'tgbotapi_thread_cpu_seconds_total')
+    process = metric_sum(values, 'tgbotapi_process_cpu_seconds_total')
+    log('CPU: client %.2f, tdlib %.2f, unattributed %.2f, threads %.2f, process %.2f' %
+        (client, tdlib, unattributed, threads, process))
+    assert client > 0 and tdlib > 0, (client, tdlib)
+    # samples are taken each 10 ms of CPU time of a thread and collected each second
+    assert abs(client + tdlib + unattributed - threads) <= 0.2 * threads + 0.3, (client, tdlib, unattributed, threads)
+    assert threads <= process + 0.1, (threads, process)
+    return client + tdlib
+
+
+def scenario_resources():
+    """CPU time, storage and memory usage of the bot are exported and CPU time is accumulated across restarts."""
+    work = prepare('resources', 0)
+    proc = start_server(work, '--tdlib-restart-cooldown=1')
+    try:
+        assert api('getMe')[0]['ok']
+
+        def tdlib_load():
+            # invalid file identifiers are checked by TDLib
+            for _ in range(300):
+                api('getFile', file_id='AgADBAADbad')
+
+        threads = [threading.Thread(target=tdlib_load) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        time.sleep(1.5)  # wait for CPU samples to be collected
+        values = check_request_metrics()
+        cpu_before_restart = check_cpu_metrics(values)
+
+        assert metric_sum(values, 'tgbotapi_bot_storage_bytes', type='database') > 0
+        for name in ['tgbotapi_process_disk_read_bytes_total', 'tgbotapi_process_disk_written_bytes_total']:
+            assert (name, frozenset()) in values, name
+        assert metric_sum(values, 'tgbotapi_thread_disk_written_bytes_total') <= metric_sum(
+            values, 'tgbotapi_process_disk_written_bytes_total')
+        log('disk: written %d bytes, TDLib database thread wrote %d bytes' % (
+            metric_sum(values, 'tgbotapi_process_disk_written_bytes_total'),
+            metric_sum(values, 'tgbotapi_thread_disk_written_bytes_total', scheduler=1)))
+        assert ('tgbotapi_bot_storage_files', frozenset({('bot', str(BOT_ID))})) in values
+        assert metric_sum(values, 'tgbotapi_bot_tdlib_objects', type='user') >= 1
+        object_types = {dict(labels)['type'] for (name, labels) in values if name == 'tgbotapi_bot_tdlib_objects'}
+        for object_type in ['file_id', 'file_node', 'chat', 'message', 'message_file_source', 'video', 'document']:
+            assert object_type in object_types, (object_type, object_types)
+
+        stats('?restart=%d' % BOT_ID)
+        wait_for(lambda: restart_count() >= 1, 30, 'restart')
+        assert api('getMe')[0]['ok']
+        threads = [threading.Thread(target=tdlib_load) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        time.sleep(1.5)
+        values = check_request_metrics()
+        cpu_after_restart = check_cpu_metrics(values)
+        assert cpu_after_restart > cpu_before_restart, (cpu_before_restart, cpu_after_restart)
+        assert metric_sum(values, 'tgbotapi_bot_tdlib_objects', type='user') >= 1
+    finally:
+        stop_server(proc)
+
+
 def main():
     global BUILD_DIR, WORK_ROOT
     if len(sys.argv) < 2:
         print(__doc__ or 'Usage: restart_test.py <build dir> [scenario]...')
         sys.exit(1)
     BUILD_DIR = os.path.abspath(sys.argv[1])
-    scenarios = sys.argv[2:] or ['webhook', 'polling', 'drain_timeout', 'policy', 'metrics']
+    scenarios = sys.argv[2:] or ['webhook', 'polling', 'drain_timeout', 'policy', 'metrics', 'resources']
     WORK_ROOT = tempfile.mkdtemp(prefix='telegram-bot-api-restart-test-')
     try:
         for scenario in scenarios:

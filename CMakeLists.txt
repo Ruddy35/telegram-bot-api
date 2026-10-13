@@ -2,6 +2,37 @@ cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
 
 project(TelegramBotApi VERSION 10.3 LANGUAGES CXX)
 
+# apply patches from td-patches to TDLib sources; already applied patches are skipped
+option(TELEGRAM_BOT_API_APPLY_TD_PATCHES "Apply patches from td-patches to TDLib sources" ON)
+if (TELEGRAM_BOT_API_APPLY_TD_PATCHES)
+  file(GLOB TD_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/td-patches/*.patch")
+  list(SORT TD_PATCHES)
+  if (TD_PATCHES)
+    find_package(Git)
+    if (NOT GIT_FOUND)
+      message(FATAL_ERROR "Git is needed to apply patches from td-patches to TDLib sources. Apply them manually and "
+                          "pass -DTELEGRAM_BOT_API_APPLY_TD_PATCHES=OFF to CMake.")
+    endif()
+  endif()
+  foreach (TD_PATCH ${TD_PATCHES})
+    # GIT_CEILING_DIRECTORIES prevents applying the patch relative to the Bot API repository if td isn't a repository
+    set(TD_GIT_APPLY "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_SOURCE_DIR}"
+                     "${GIT_EXECUTABLE}" apply --whitespace=nowarn)
+    execute_process(COMMAND ${TD_GIT_APPLY} --reverse --check "${TD_PATCH}"
+                    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/td"
+                    RESULT_VARIABLE TD_PATCH_IS_APPLIED OUTPUT_QUIET ERROR_QUIET)
+    if (NOT TD_PATCH_IS_APPLIED EQUAL 0)
+      execute_process(COMMAND ${TD_GIT_APPLY} "${TD_PATCH}"
+                      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/td"
+                      RESULT_VARIABLE TD_PATCH_RESULT ERROR_VARIABLE TD_PATCH_ERROR)
+      if (NOT TD_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR "Failed to apply ${TD_PATCH} to TDLib sources: ${TD_PATCH_ERROR}")
+      endif()
+      message(STATUS "Applied ${TD_PATCH} to TDLib sources")
+    endif()
+  endforeach()
+endif()
+
 add_subdirectory(td EXCLUDE_FROM_ALL)
 
 if (NOT DEFINED CMAKE_MODULE_PATH)
@@ -65,6 +96,7 @@ set(TELEGRAM_BOT_API_SOURCE
   telegram-bot-api/BotMetrics.cpp
   telegram-bot-api/Client.cpp
   telegram-bot-api/ClientManager.cpp
+  telegram-bot-api/CpuSampler.cpp
   telegram-bot-api/HttpConnection.cpp
   telegram-bot-api/HttpStatConnection.cpp
   telegram-bot-api/Query.cpp
@@ -76,6 +108,7 @@ set(TELEGRAM_BOT_API_SOURCE
   telegram-bot-api/Client.h
   telegram-bot-api/ClientManager.h
   telegram-bot-api/ClientParameters.h
+  telegram-bot-api/CpuSampler.h
   telegram-bot-api/HttpConnection.h
   telegram-bot-api/HttpServer.h
   telegram-bot-api/HttpStatConnection.h
@@ -88,6 +121,14 @@ set(TELEGRAM_BOT_API_SOURCE
 add_executable(telegram-bot-api ${TELEGRAM_BOT_API_SOURCE})
 target_include_directories(telegram-bot-api PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
 target_link_libraries(telegram-bot-api PRIVATE memprof tdactor tdcore tddb tdnet tdutils)
+if (CMAKE_SYSTEM_NAME MATCHES "Linux")
+  # timer_create is in librt before glibc 2.34
+  include(CheckLibraryExists)
+  check_library_exists(rt timer_create "" TELEGRAM_BOT_API_HAVE_LIBRT)
+  if (TELEGRAM_BOT_API_HAVE_LIBRT)
+    target_link_libraries(telegram-bot-api PRIVATE rt)
+  endif()
+endif()
 
 # test-only tools for test/restart/restart_test.py
 add_executable(restart-test-fake-auth EXCLUDE_FROM_ALL test/restart/fake_auth.cpp)

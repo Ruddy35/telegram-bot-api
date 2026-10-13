@@ -129,6 +129,9 @@ struct ClientParameters {
   double tdlib_restart_cooldown_ = 10.0;       // minimum time between automatic restarts
   bool malloc_trim_ = false;                   // call malloc_trim after restarts
 
+  // number of samples per second of CPU time of a thread used to estimate CPU time consumed by each bot; 0 if disabled
+  td::int32 cpu_sampling_rate_ = 100;
+
   double start_time_ = 0;
 
   td::ActorId<td::GetHostByNameActor> get_host_by_name_actor_id_;

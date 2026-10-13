@@ -122,8 +122,16 @@ See [MEMORY.md](MEMORY.md) for details (in Russian).
 `GET http://<stat address>:<stat port>/metrics` returns metrics in the Prometheus text format for VictoriaMetrics or
 Prometheus: requests by method, HTTP status code and failure reason, answer time, request and answer sizes, requests
 abandoned by clients, files sent by upload, local path, file_id or URL, file downloads by result, updates by type,
-webhook deliveries, disk usage, Bot API cache sizes and graceful restarts of TDLib instances of each bot.
+webhook deliveries, disk usage, Bot API cache sizes, numbers of objects in memory of TDLib instances, estimated CPU time
+and graceful restarts of TDLib instances of each bot.
 `?bot=<bot_id>` limits the output to a single bot. See [METRICS.md](METRICS.md) for details (in Russian).
+
+CPU time of each bot is estimated by sampling: each thread is interrupted with `SIGPROF` after every 10 milliseconds of
+its CPU time and the current actor context is remembered. Use `--cpu-sampling-rate` to change the number of samples
+per second of CPU time or `--cpu-sampling-rate=0` to disable the sampling. The sampling is supported only on Linux.
+
+Numbers of objects in memory require a small patch of TDLib from [td-patches](td-patches/README.md), which is applied
+automatically by CMake, so `git` is needed to build the server.
 
 <a name="license"></a>
 ## License

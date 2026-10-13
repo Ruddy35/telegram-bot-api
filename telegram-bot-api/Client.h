@@ -110,8 +110,8 @@ class Client final : public WebhookActor::Callback {
   };
   CacheStats get_cache_stats() const;
 
-  // requests storage statistics from the TDLib instance and saves them to metrics
-  void update_storage_statistics();
+  // requests storage statistics and numbers of objects in memory from the TDLib instance and saves them to metrics
+  void update_tdlib_statistics();
 
  private:
   using int32 = td::int32;
@@ -333,6 +333,7 @@ class Client final : public WebhookActor::Callback {
   class TdOnOkCallback;
   class TdOnRestartNetworkTypeCallback;
   class TdOnGetStorageStatisticsFastCallback;
+  class TdOnGetMemoryObjectCountsCallback;
   class TdOnAuthorizationCallback;
   class TdOnInitCallback;
   class TdOnGetUserProfilePhotosCallback;
@@ -548,6 +549,8 @@ class Client final : public WebhookActor::Callback {
   void on_update(object_ptr<td_api::Object> result);
 
   void on_result(td::uint64 id, object_ptr<td_api::Object> result);
+
+  void on_tdlib_context(td::uint64 context);
 
   void on_update_authorization_state();
 
@@ -1679,6 +1682,7 @@ class Client final : public WebhookActor::Callback {
 
   td::FlatHashSet<int32> cached_download_file_ids_;  // for metrics
   bool is_storage_statistics_request_active_ = false;
+  bool is_memory_object_counts_request_active_ = false;
   static td::FlatHashMap<td::string, td::int32> method_stat_ids_;
   static td::vector<td::string> method_stat_names_;
 
@@ -1886,6 +1890,7 @@ class Client final : public WebhookActor::Callback {
   size_t delayed_update_count_ = 0;
 
   std::shared_ptr<BotMetrics> metrics_;
+  td::vector<td::uint64> cpu_contexts_;  // actor contexts registered for CPU time accounting
 
   std::shared_ptr<const ClientParameters> parameters_;
 

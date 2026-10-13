@@ -61,6 +61,9 @@ Client::Client(td::ActorShared<> parent, const td::string &bot_token, bool is_te
 }
 
 Client::~Client() {
+  for (auto context : cpu_contexts_) {
+    BotMetrics::unregister_cpu_context(context, this);
+  }
   td::Scheduler::instance()->destroy_on_scheduler(SharedData::get_file_gc_scheduler_id(), messages_, users_, groups_,
                                                   supergroups_, chats_, communities_, sticker_set_names_);
 }
@@ -6838,6 +6841,29 @@ class Client::TdOnGetStorageStatisticsFastCallback final : public TdQueryCallbac
   Client *client_;
 };
 
+class Client::TdOnGetMemoryObjectCountsCallback final : public TdQueryCallback {
+ public:
+  explicit TdOnGetMemoryObjectCountsCallback(Client *client) : client_(client) {
+  }
+
+  void on_result(object_ptr<td_api::Object> result) final {
+    client_->is_memory_object_counts_request_active_ = false;
+    if (result->get_id() == td_api::error::ID) {
+      return;
+    }
+    CHECK(result->get_id() == td_api::memoryObjectCounts::ID);
+    auto counts = move_object_as<td_api::memoryObjectCounts>(result);
+    td::vector<std::pair<td::string, td::int64>> object_counts;
+    for (auto &count : counts->counts_) {
+      object_counts.emplace_back(std::move(count->type_), count->count_);
+    }
+    client_->metrics_->set_tdlib_object_counts(std::move(object_counts));
+  }
+
+ private:
+  Client *client_;
+};
+
 class Client::TdOnAuthorizationCallback final : public TdQueryCallback {
  public:
   explicit TdOnAuthorizationCallback(Client *client) : client_(client) {
@@ -8816,14 +8842,20 @@ void Client::cancel_restart(td::Slice reason) {
   restart_promise_.set_error(td::Status::Error(500, reason));
 }
 
-void Client::update_storage_statistics() {
-  if (td_client_.empty() || !was_authorized_ || closing_ || logging_out_ || is_restart_in_progress() ||
-      is_storage_statistics_request_active_) {
+void Client::update_tdlib_statistics() {
+  if (td_client_.empty() || !was_authorized_ || closing_ || logging_out_ || is_restart_in_progress()) {
     return;
   }
-  is_storage_statistics_request_active_ = true;
-  do_send_request(make_object<td_api::getStorageStatisticsFast>(),
-                  td::make_unique<TdOnGetStorageStatisticsFastCallback>(this));
+  if (!is_storage_statistics_request_active_) {
+    is_storage_statistics_request_active_ = true;
+    do_send_request(make_object<td_api::getStorageStatisticsFast>(),
+                    td::make_unique<TdOnGetStorageStatisticsFastCallback>(this));
+  }
+  if (!is_memory_object_counts_request_active_) {
+    is_memory_object_counts_request_active_ = true;
+    do_send_request(make_object<td_api::getMemoryObjectCounts>(),
+                    td::make_unique<TdOnGetMemoryObjectCountsCallback>(this));
+  }
 }
 
 void Client::log_out(int32 error_code, td::Slice error_message) {
@@ -8922,6 +8954,8 @@ void Client::start_up() {
   auto context = std::make_shared<td::ActorContext>();
   set_context(context);
   set_tag(bot_token_id_);
+  cpu_contexts_.push_back(reinterpret_cast<td::uint64>(context.get()));
+  metrics_->register_cpu_context(cpu_contexts_.back(), BotMetrics::CpuPart::Client, this);
 
   auto suff = bot_token_with_dc_ + TD_DIR_SLASH;
   if (!parameters_->allow_colon_in_filenames_) {
@@ -8939,19 +8973,42 @@ void Client::start_up() {
     explicit TdCallback(td::ActorId<Client> client) : client_(std::move(client)) {
     }
     void on_result(td::uint64 id, object_ptr<td_api::Object> result) final {
+      check_context();
       send_closure_later(client_, &Client::on_result, id, std::move(result));
     }
     void on_error(td::uint64 id, object_ptr<td_api::error> result) final {
+      check_context();
       send_closure_later(client_, &Client::on_result, id, std::move(result));
     }
 
    private:
     td::ActorId<Client> client_;
+    td::uint64 last_context_ = 0;
+
+    // the callback is called by TDLib in the context of the TDLib instance, which is used to attribute CPU time
+    void check_context() {
+      auto *context = td::Scheduler::context();
+      auto context_key = reinterpret_cast<td::uint64>(context);
+      if (context_key != last_context_) {
+        last_context_ = context_key;
+        if (context != nullptr && context->get_id() != 0) {
+          send_closure_later(client_, &Client::on_tdlib_context, context_key);
+        }
+      }
+    }
   };
   td::ClientActor::Options options;
   options.net_query_stats = parameters_->net_query_stats_;
   td_client_ = td::create_actor_on_scheduler<td::ClientActor>(
       "TdClientActor", 0, td::make_unique<TdCallback>(actor_id(this)), std::move(options));
+}
+
+void Client::on_tdlib_context(td::uint64 context) {
+  if (td::contains(cpu_contexts_, context)) {
+    return;
+  }
+  cpu_contexts_.push_back(context);
+  metrics_->register_cpu_context(context, BotMetrics::CpuPart::Tdlib, this);
 }
 
 void Client::send(PromisedQueryPtr query) {
@@ -9794,6 +9851,7 @@ void Client::on_update_authorization_state() {
         }
         last_update_creation_time_ = td::Time::now();
         log_in_date_ = get_unix_time();
+        update_tdlib_statistics();
       }
       return loop();
     }

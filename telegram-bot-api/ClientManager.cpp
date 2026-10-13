@@ -214,13 +214,13 @@ void ClientManager::on_restart_check_timer() {
   auto now = td::Time::now();
   check_restarts(now);
 
-  if (now >= next_storage_statistics_time_) {
-    next_storage_statistics_time_ = now + STORAGE_STATISTICS_PERIOD;
+  if (now >= next_tdlib_statistics_time_) {
+    next_tdlib_statistics_time_ = now + TDLIB_STATISTICS_PERIOD;
     for (auto id : clients_.ids()) {
       auto *client_info = clients_.get(id);
       CHECK(client_info != nullptr);
       if (!client_info->client_.empty() && client_info->was_authorized_) {
-        send_closure(client_info->client_, &Client::update_storage_statistics);
+        send_closure(client_info->client_, &Client::update_tdlib_statistics);
       }
     }
   }
@@ -677,6 +677,15 @@ void ClientManager::add_bot_metrics(MetricsWriter &writer, const ClientInfo &cli
   // TDLib instance
   writer.add("tgbotapi_bot_tdlib_updates_total", counter, "Number of updates received from TDLib", bot_label,
              metrics.tdlib_updates_);
+  if (cpu_sampling_period_ > 0.0) {
+    for (std::size_t part = 0; part < static_cast<std::size_t>(BotMetrics::CpuPart::Size); part++) {
+      writer.add("tgbotapi_bot_cpu_seconds_total", counter,
+                 "Estimated CPU time consumed by the bot: client for the Bot API part, tdlib for the TDLib instance",
+                 PSLICE() << bot_label << ",part=\""
+                          << BotMetrics::get_cpu_part_name(static_cast<BotMetrics::CpuPart>(part)) << '"',
+                 static_cast<double>(metrics.cpu_samples_[part]) * cpu_sampling_period_);
+    }
+  }
   writer.add("tgbotapi_bot_tdlib_restarts_total", counter, "Number of graceful restarts of the TDLib instance",
              bot_label, static_cast<td::int64>(client_info.restart_count_));
   writer.add("tgbotapi_bot_tdlib_restart_in_progress", gauge, "Whether the TDLib instance is being restarted",
@@ -695,6 +704,13 @@ void ClientManager::add_bot_metrics(MetricsWriter &writer, const ClientInfo &cli
                PSLICE() << bot_label << ",type=\"log\"", metrics.storage_log_size_);
     writer.add("tgbotapi_bot_storage_files", gauge, "Number of files of the bot on the disk", bot_label,
                metrics.storage_file_count_);
+  }
+  for (auto &object_count : metrics.tdlib_object_counts_) {
+    writer.add("tgbotapi_bot_tdlib_objects", gauge,
+               "Number of objects of different types in memory of the TDLib instance, which are never deleted or "
+               "deleted only after some time",
+               PSLICE() << bot_label << ",type=\"" << MetricsWriter::escape_label_value(object_count.first) << '"',
+               object_count.second);
   }
 
   writer.add("tgbotapi_bot_active_requests", gauge, "Number of requests being processed", bot_label,
@@ -774,6 +790,39 @@ void ClientManager::get_metrics(td::Promise<td::BufferSlice> promise,
                  static_cast<double>(cpu_stat.process_system_ticks_) / static_cast<double>(ticks_per_second));
     }
 #endif
+    if (cpu_sampling_period_ > 0.0) {
+      writer.add("tgbotapi_cpu_sampling_period_seconds", gauge,
+                 "CPU time of a thread between two samples used to estimate CPU time consumed by bots", td::Slice(),
+                 cpu_sampling_period_);
+      writer.add("tgbotapi_cpu_unattributed_seconds_total", counter,
+                 "Estimated CPU time consumed by the server outside of authorized bots, for example, by HTTP "
+                 "connections",
+                 td::Slice(), static_cast<double>(unattributed_cpu_samples_) * cpu_sampling_period_);
+      for (std::size_t scheduler_id = 0; scheduler_id < thread_cpu_times_.size(); scheduler_id++) {
+        writer.add("tgbotapi_thread_cpu_seconds_total", counter, "CPU time consumed by each scheduler thread",
+                   PSLICE() << "scheduler=\"" << scheduler_id << '"', thread_cpu_times_[scheduler_id]);
+      }
+      for (std::size_t scheduler_id = 0; scheduler_id < thread_ids_.size(); scheduler_id++) {
+        if (thread_ids_[scheduler_id] == 0) {
+          continue;
+        }
+        auto r_io_stat = CpuSampler::get_io_stat(thread_ids_[scheduler_id]);
+        if (r_io_stat.is_ok()) {
+          td::string labels = PSTRING() << "scheduler=\"" << scheduler_id << '"';
+          writer.add("tgbotapi_thread_disk_read_bytes_total", counter,
+                     "Bytes read from the disk by each scheduler thread", labels, r_io_stat.ok().read_bytes);
+          writer.add("tgbotapi_thread_disk_written_bytes_total", counter,
+                     "Bytes written to the disk by each scheduler thread", labels, r_io_stat.ok().written_bytes);
+        }
+      }
+    }
+    auto r_io_stat = CpuSampler::get_io_stat(0);
+    if (r_io_stat.is_ok()) {
+      writer.add("tgbotapi_process_disk_read_bytes_total", counter, "Bytes read from the disk by the process",
+                 td::Slice(), r_io_stat.ok().read_bytes);
+      writer.add("tgbotapi_process_disk_written_bytes_total", counter, "Bytes written to the disk by the process",
+                 td::Slice(), r_io_stat.ok().written_bytes);
+    }
     writer.add("tgbotapi_buffer_memory_bytes", gauge, "Memory used by network buffers", td::Slice(),
                static_cast<td::int64>(td::BufferAllocator::get_buffer_mem()));
     writer.add("tgbotapi_active_requests", gauge, "Number of requests being processed", td::Slice(),
@@ -1051,6 +1100,41 @@ void ClientManager::start_up() {
   set_timeout_in(600.0);
 
   schedule_restart_check();
+
+  start_cpu_sampling();
+}
+
+void ClientManager::start_cpu_sampling() {
+  if (parameters_->cpu_sampling_rate_ <= 0) {
+    return;
+  }
+  auto status = CpuSampler::init();
+  if (status.is_error()) {
+    LOG(ERROR) << "Failed to start CPU sampling: " << status;
+    return;
+  }
+  cpu_sampling_period_ = 1.0 / parameters_->cpu_sampling_rate_;
+  auto thread_count = SharedData::get_thread_count();
+  thread_cpu_times_.resize(static_cast<std::size_t>(thread_count));
+  thread_ids_.resize(static_cast<std::size_t>(thread_count));
+  for (td::int32 scheduler_id = 0; scheduler_id < thread_count; scheduler_id++) {
+    cpu_samplers_.push_back(td::create_actor_on_scheduler<CpuSampler>(
+        "CpuSampler", scheduler_id, cpu_sampling_period_, [actor_id = actor_id(this)](CpuSampler::Samples samples) {
+          send_closure(actor_id, &ClientManager::on_cpu_samples, std::move(samples));
+        }));
+  }
+}
+
+void ClientManager::on_cpu_samples(CpuSampler::Samples samples) {
+  for (auto &context : samples.contexts_) {
+    if (!BotMetrics::add_cpu_samples(context.first, context.second)) {
+      unattributed_cpu_samples_ += static_cast<td::int64>(context.second);
+    }
+  }
+  if (samples.scheduler_id >= 0 && static_cast<std::size_t>(samples.scheduler_id) < thread_cpu_times_.size()) {
+    thread_cpu_times_[samples.scheduler_id] = samples.thread_cpu_time;
+    thread_ids_[samples.scheduler_id] = samples.thread_id;
+  }
 }
 
 PromisedQueryPtr ClientManager::get_webhook_restore_query(td::Slice token, td::Slice webhook_info,
@@ -1261,6 +1345,9 @@ void ClientManager::hangup_shared() {
     // per-bot metrics are exported only for authorized bots; keep totals of the others
     for (auto &it : info->metrics_->requests_) {
       unauthorized_bot_requests_[BotMetrics::decode_request_key(it.first).second.first] += it.second;
+    }
+    for (auto cpu_samples : info->metrics_->cpu_samples_) {
+      unattributed_cpu_samples_ += cpu_samples;
     }
   }
 

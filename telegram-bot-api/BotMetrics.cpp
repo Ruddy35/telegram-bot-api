@@ -96,6 +96,10 @@ void BotMetrics::on_tdlib_update() {
   tdlib_updates_++;
 }
 
+void BotMetrics::set_tdlib_object_counts(td::vector<std::pair<td::string, td::int64>> object_counts) {
+  tdlib_object_counts_ = std::move(object_counts);
+}
+
 void BotMetrics::set_storage_statistics(td::int64 files_size, td::int64 file_count, td::int64 database_size,
                                         td::int64 log_size) {
   has_storage_statistics_ = true;
@@ -103,6 +107,48 @@ void BotMetrics::set_storage_statistics(td::int64 files_size, td::int64 file_cou
   storage_file_count_ = file_count;
   storage_database_size_ = database_size;
   storage_log_size_ = log_size;
+}
+
+namespace {
+struct CpuContextInfo {
+  BotMetrics *metrics = nullptr;
+  BotMetrics::CpuPart part = BotMetrics::CpuPart::Client;
+  const void *owner = nullptr;
+};
+
+// actor context pointer -> the bot consuming its CPU time; must be used only from the client scheduler
+td::FlatHashMap<td::uint64, CpuContextInfo> &get_cpu_contexts() {
+  static auto *cpu_contexts = new td::FlatHashMap<td::uint64, CpuContextInfo>();
+  return *cpu_contexts;
+}
+}  // namespace
+
+void BotMetrics::register_cpu_context(td::uint64 context, CpuPart part, const void *owner) {
+  CHECK(context != 0);
+  CHECK(owner != nullptr);
+  // memory of a destroyed context can be reused for a new context, so the last registration wins
+  get_cpu_contexts()[context] = CpuContextInfo{this, part, owner};
+}
+
+void BotMetrics::unregister_cpu_context(td::uint64 context, const void *owner) {
+  auto &cpu_contexts = get_cpu_contexts();
+  auto it = cpu_contexts.find(context);
+  if (it != cpu_contexts.end() && it->second.owner == owner) {
+    cpu_contexts.erase(it);
+  }
+}
+
+bool BotMetrics::add_cpu_samples(td::uint64 context, td::uint64 count) {
+  if (context == 0) {
+    return false;
+  }
+  auto &cpu_contexts = get_cpu_contexts();
+  auto it = cpu_contexts.find(context);
+  if (it == cpu_contexts.end()) {
+    return false;
+  }
+  it->second.metrics->cpu_samples_[static_cast<std::size_t>(it->second.part)] += static_cast<td::int64>(count);
+  return true;
 }
 
 td::Slice BotMetrics::get_fail_reason_name(QueryFailReason reason) {
@@ -187,6 +233,17 @@ td::Slice BotMetrics::get_webhook_result_name(WebhookResult result) {
       return td::Slice("connection_error");
     case WebhookResult::Dropped:
       return td::Slice("dropped");
+    default:
+      return td::Slice("unknown");
+  }
+}
+
+td::Slice BotMetrics::get_cpu_part_name(CpuPart part) {
+  switch (part) {
+    case CpuPart::Client:
+      return td::Slice("client");
+    case CpuPart::Tdlib:
+      return td::Slice("tdlib");
     default:
       return td::Slice("unknown");
   }

@@ -286,6 +286,11 @@ int main(int argc, char *argv[]) {
                                          "(default is "
                                       << tdlib_restart_cooldown << ")",
                              td::OptionParser::parse_integer(tdlib_restart_cooldown));
+  options.add_checked_option('\0', "cpu-sampling-rate",
+                             PSLICE() << "number of samples per second of CPU time of each thread, which are used to "
+                                         "estimate CPU time consumed by each bot; 0 disables the sampling (default is "
+                                      << parameters->cpu_sampling_rate_ << ")",
+                             td::OptionParser::parse_integer(parameters->cpu_sampling_rate_));
   options.add_checked_option('\0', "http-ip-address",
                              "local IP address, HTTP connections to which will be accepted. By default, connections to "
                              "any local IPv4 address are accepted",
@@ -361,6 +366,9 @@ int main(int argc, char *argv[]) {
     }
     if (tdlib_restart_memory_limit > (static_cast<td::int64>(1) << 40)) {
       return td::Status::Error("Too big TDLib restart memory limit specified");
+    }
+    if (parameters->cpu_sampling_rate_ < 0 || parameters->cpu_sampling_rate_ > 1000) {
+      return td::Status::Error("CPU sampling rate must be between 0 and 1000");
     }
     return td::Status::OK();
   });

@@ -8,6 +8,7 @@
 
 #include "telegram-bot-api/BotMetrics.h"
 #include "telegram-bot-api/Client.h"
+#include "telegram-bot-api/CpuSampler.h"
 #include "telegram-bot-api/Query.h"
 #include "telegram-bot-api/Stats.h"
 #include "telegram-bot-api/Watchdog.h"
@@ -141,10 +142,21 @@ class ClientManager final : public td::Actor {
   static td::Slice get_reject_reason_name(RejectReason reason);
   std::array<td::int64, static_cast<std::size_t>(RejectReason::Size)> rejected_queries_{};
   td::FlatHashMap<td::int32, td::int64> unauthorized_bot_requests_;  // HTTP status code -> count; for removed bots
-  double next_storage_statistics_time_ = 0.0;
-  static constexpr double STORAGE_STATISTICS_PERIOD = 60.0;
+  double next_tdlib_statistics_time_ = 0.0;
+  static constexpr double TDLIB_STATISTICS_PERIOD = 60.0;
 
   void add_bot_metrics(MetricsWriter &writer, const ClientInfo &client_info, double now);
+
+  // statistical estimation of CPU time consumed by each bot
+  double cpu_sampling_period_ = 0.0;  // 0 if the sampling is disabled
+  td::vector<td::ActorOwn<CpuSampler>> cpu_samplers_;
+  td::int64 unattributed_cpu_samples_ = 0;
+  td::vector<double> thread_cpu_times_;  // scheduler identifier -> total CPU time consumed by the thread
+  td::vector<td::int64> thread_ids_;     // scheduler identifier -> identifier of the thread in the OS
+
+  void start_cpu_sampling();
+
+  void on_cpu_samples(CpuSampler::Samples samples);
 
   static constexpr double WATCHDOG_TIMEOUT = 0.25;
   static constexpr std::size_t MAX_RESTART_QUERIES = 10000;
