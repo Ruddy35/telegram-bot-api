@@ -45,7 +45,7 @@ class Client final : public WebhookActor::Callback {
  public:
   Client(td::ActorShared<> parent, const td::string &bot_token, bool is_test_dc, td::int64 tqueue_id,
          std::shared_ptr<const ClientParameters> parameters, td::ActorId<BotStatActor> stat_actor,
-         std::shared_ptr<BotMetrics> metrics, double first_start_time = 0.0);
+         std::shared_ptr<BotMetrics> metrics, double first_start_time);
   Client(const Client &) = delete;
   Client &operator=(const Client &) = delete;
   Client(Client &&) = delete;
@@ -60,15 +60,17 @@ class Client final : public WebhookActor::Callback {
   void close();
 
   // Graceful restart of the TDLib instance to release all memory used by it. It is done in two phases.
-  // 1. restart: the caller must stop sending getUpdates queries to the Client; the Client pauses the webhook and waits
-  //    until there are no active requests and no updates being sent to the webhook. The promise is resolved when the
-  //    phase is finished.
+  // 1. restart: the caller must stop sending getUpdates queries to the Client; the Client answers the active getUpdates
+  //    query, pauses the webhook and waits until there are no active requests and no updates being sent to the webhook.
+  //    The promise is resolved when the phase is finished.
   // 2. continue_restart: the caller must stop sending any queries to the Client; the Client waits until all active
-  //    requests are answered and all received updates are handled, then closes the TDLib instance and stops itself
-  //    without failing any request. The promise is resolved right before the TDLib instance is closed. The caller
-  //    must create a new Client for the bot after the Client is stopped.
-  // If any of the promises fails, then the restart is cancelled and the Client continues to work as usual.
-  void restart(double max_drain_time, td::Promise<td::Unit> promise);
+  //    requests to TDLib are finished and all received updates are handled, then closes the TDLib instance and stops
+  //    itself without failing any request. The promise is resolved right before the TDLib instance is closed. The
+  //    caller must create a new Client for the bot after the Client is stopped.
+  // Both phases must be finished in drain_timeout seconds, excluding the time to disable network in the second phase.
+  // If a promise fails, then the restart was cancelled, and the Client continues to work as usual, unless it is being
+  // closed or logged out.
+  void restart(double drain_timeout, td::Promise<td::Unit> promise);
 
   void continue_restart(td::Promise<td::Unit> promise);
 
@@ -78,7 +80,7 @@ class Client final : public WebhookActor::Callback {
   // returns true if the Client can be gracefully restarted now
   bool can_restart() const {
     return !td_client_.empty() && was_authorized_ && !closing_ && !logging_out_ && !need_close_ &&
-           restart_state_ == RestartState::None;
+           restart_state_ == RestartState::None && !webhook_set_query_ && !active_webhook_set_query_;
   }
 
   // the number of updates received from the TDLib instance; used as an estimation of its memory usage
@@ -566,15 +568,15 @@ class Client final : public WebhookActor::Callback {
 
   bool is_restart_in_progress() const;
 
-  bool is_ready_for_restart_drain() const;
+  bool can_finish_restart_pause() const;
 
-  bool is_ready_for_restart() const;
+  bool can_close_for_restart() const;
 
   void check_restart();
 
   void on_restart_network_disabled(td::uint64 restart_generation, bool is_ok);
 
-  void on_webhook_paused(td::uint64 restart_generation, td::uint64 webhook_generation, bool is_ok);
+  void on_webhook_paused(td::uint64 restart_generation, bool is_ok);
 
   void cancel_restart(td::Slice reason);
 
@@ -1665,14 +1667,19 @@ class Client final : public WebhookActor::Callback {
   bool clear_tqueue_ = false;
 
   // graceful restart of the TDLib instance
+  //  Pausing: getUpdates is answered, the webhook is being paused, active requests are being finished;
+  //  Paused: waiting for continue_restart;
+  //  Draining: active requests to TDLib are being finished and received updates are being handled;
+  //  GoingOffline: waiting for an answer to setNetworkType(networkTypeNone);
+  //  Offline: waiting RESTART_OFFLINE_DELAY for updates, which could have been received before the network was disabled;
+  //  Closing: the TDLib instance is being closed.
   enum class RestartState : td::int8 { None, Pausing, Paused, Draining, GoingOffline, Offline, Closing };
   RestartState restart_state_ = RestartState::None;
   td::Promise<td::Unit> restart_promise_;
-  td::uint64 restart_generation_ = 0;
+  td::uint64 restart_generation_ = 0;  // changed when a restart is started or cancelled
   td::uint64 restart_webhook_generation_ = 0;
-  double restart_max_drain_time_ = 0.0;
-  double restart_deadline_ = 0.0;
-  double restart_offline_check_time_ = 0.0;
+  double restart_deadline_ = 0.0;  // the restart is cancelled if it isn't ready to close the instance at the time
+  double restart_offline_check_time_ = 0.0;  // GoingOffline: deadline for the answer; Offline: end of the delay
   bool is_webhook_paused_ = false;
   static constexpr double RESTART_CHECK_INTERVAL = 0.05;
   static constexpr double RESTART_OFFLINE_DELAY = 0.5;

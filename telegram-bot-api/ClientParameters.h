@@ -124,11 +124,12 @@ struct ClientParameters {
   // graceful restart of TDLib instances to release memory
   double tdlib_restart_interval_ = 0.0;           // restart TDLib instances after the specified uptime; 0 if disabled
   td::int64 tdlib_restart_memory_limit_ = 0;      // restart TDLib instances while RSS exceeds the limit; 0 if disabled
-  td::int64 tdlib_restart_bot_memory_limit_ = 0;  // restart a TDLib instance using more memory; 0 if disabled
-  double tdlib_restart_min_uptime_ = 3600.0;      // minimum TDLib instance uptime for a restart due to the memory limit
-  double tdlib_restart_drain_timeout_ = 30.0;     // maximum time to wait for active requests before a restart
-  double tdlib_restart_cooldown_ = 10.0;          // minimum time between automatic restarts
-  bool malloc_trim_ = false;                      // call malloc_trim after restarts
+  td::int64 tdlib_restart_bot_memory_limit_ = 0;  // restart a TDLib instance using more memory; 0 if disabled or if
+                                                  // memory accounting is disabled
+  double tdlib_restart_min_uptime_ = 3600.0;      // minimum TDLib instance uptime for a restart due to a memory limit
+  double tdlib_restart_drain_timeout_ = 30.0;  // maximum time to wait for active requests before closing for a restart
+  double tdlib_restart_cooldown_ = 10.0;       // minimum time between starts of restarts
+  bool malloc_trim_ = false;                   // call malloc_trim after restarts
 
   // number of samples per second of CPU time of a thread used to estimate CPU time consumed by each bot; 0 if disabled
   td::int32 cpu_sampling_rate_ = 100;

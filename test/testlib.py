@@ -81,14 +81,14 @@ def prepare_work_dir(build_dir, work, bots=BOTS, update_count=0):
                         str(bots[0][1]), str(update_count)], check=True, capture_output=True)
 
 
-def http_request(port, token, method, params, timeout=60):
-    """Calls an API method; returns (decoded response, latency in seconds). Network errors are returned as responses
-    with ok == False."""
+def http_request(port, token, method, params, http_timeout=60):
+    """Calls an API method; returns (decoded response, latency in seconds). Network errors and timeouts are returned as
+    responses with ok == False and without error_code."""
     request = urllib.request.Request('http://127.0.0.1:%d/bot%s/%s' % (port, token, method),
                                      data=json.dumps(params).encode(), headers={'Content-Type': 'application/json'})
     start = time.time()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as r:
+        with urllib.request.urlopen(request, timeout=http_timeout) as r:
             result = json.loads(r.read())
     except urllib.error.HTTPError as e:
         result = json.loads(e.read())
@@ -151,8 +151,9 @@ class Server:
             self.proc.kill()
             self.proc.wait()
 
-    def api(self, method, token=TOKEN, timeout=60, **params):
-        return http_request(self.api_port, token, method, params, timeout)
+    def api(self, method, token=TOKEN, http_timeout=60, **params):
+        """Calls an API method with the parameters; http_timeout is the time to wait for the answer."""
+        return http_request(self.api_port, token, method, params, http_timeout)
 
     def metrics(self):
         with urllib.request.urlopen('http://127.0.0.1:%d/metrics' % self.stat_port, timeout=30) as r:

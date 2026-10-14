@@ -261,37 +261,38 @@ int main(int argc, char *argv[]) {
       td::OptionParser::parse_integer(parameters->message_unload_delay_));
   options.add_checked_option('\0', "tdlib-restart-interval",
                              "gracefully restart TDLib instance of each bot after the specified number of seconds of "
-                             "its work to release all memory used by it; requests aren't failed during a restart, they "
-                             "are delayed for a few seconds instead (disabled by default)",
+                             "its work plus a random delay of up to 10% to release all memory used by it; requests "
+                             "received during a restart are delayed until its end (disabled by default)",
                              td::OptionParser::parse_integer(tdlib_restart_interval));
   options.add_checked_option('\0', "tdlib-restart-memory-limit",
-                             "gracefully restart TDLib instances of the most active bots one by one while memory usage "
-                             "of the server exceeds the specified number of megabytes (disabled by default)",
+                             "gracefully restart TDLib instances one by one, starting with the instance using the most "
+                             "memory, while resident memory of the server exceeds the specified number of megabytes; "
+                             "checked every 5 seconds (disabled by default)",
                              td::OptionParser::parse_integer(tdlib_restart_memory_limit));
   options.add_checked_option('\0', "tdlib-restart-bot-memory-limit",
                              "gracefully restart TDLib instance of a bot, which uses more than the specified number of "
-                             "megabytes of memory together with its Bot API cache, excluding pending updates; requires "
-                             "memory accounting (disabled by default)",
+                             "megabytes of memory together with its Bot API cache, excluding pending updates; checked "
+                             "every 5 seconds; requires memory accounting (disabled by default)",
                              td::OptionParser::parse_integer(tdlib_restart_bot_memory_limit));
   options.add_checked_option('\0', "tdlib-restart-min-uptime",
                              PSLICE() << "minimum uptime in seconds of a TDLib instance before it can be restarted "
-                                         "because of the memory limit (default is "
+                                         "because of a memory limit (default is "
                                       << tdlib_restart_min_uptime << ")",
                              td::OptionParser::parse_integer(tdlib_restart_min_uptime));
   options.add_checked_option(
       '\0', "tdlib-restart-drain-timeout",
-      PSLICE() << "maximum time in seconds to wait for completion of active requests of a bot "
-                  "before restart of its TDLib instance; the restart is postponed if the time is "
-                  "exceeded (default is "
+      PSLICE() << "maximum time in seconds to wait for completion of active requests of a bot before its TDLib "
+                  "instance is closed for a restart; the restart is cancelled if the time is exceeded and an automatic "
+                  "restart is retried after 5 minutes or more; must be between 1 and 3600 (default is "
                << tdlib_restart_drain_timeout << ")",
       td::OptionParser::parse_integer(tdlib_restart_drain_timeout));
   options.add_option('\0', "malloc-trim",
-                     "return free memory to the OS using malloc_trim after each restart of a TDLib instance; useful "
-                     "only with glibc memory allocator",
+                     "return free memory to the OS using malloc_trim 10 seconds after the last restart of a TDLib "
+                     "instance; works only with the glibc memory allocator",
                      [&] { parameters->malloc_trim_ = true; });
   options.add_checked_option('\0', "tdlib-restart-cooldown",
-                             PSLICE() << "minimum delay in seconds between automatic restarts of TDLib instances "
-                                         "(default is "
+                             PSLICE() << "minimum delay in seconds between starts of restarts of TDLib instances, "
+                                         "including requested ones (default is "
                                       << tdlib_restart_cooldown << ")",
                              td::OptionParser::parse_integer(tdlib_restart_cooldown));
   options.add_checked_option('\0', "cpu-sampling-rate",
@@ -374,8 +375,8 @@ int main(int argc, char *argv[]) {
         tdlib_restart_cooldown < 0) {
       return td::Status::Error("Wrong TDLib restart parameters specified");
     }
-    if (tdlib_restart_drain_timeout <= 0) {
-      return td::Status::Error("TDLib restart drain timeout must be positive");
+    if (tdlib_restart_drain_timeout <= 0 || tdlib_restart_drain_timeout > 3600) {
+      return td::Status::Error("TDLib restart drain timeout must be between 1 and 3600");
     }
     if (tdlib_restart_memory_limit > (static_cast<td::int64>(1) << 40)) {
       return td::Status::Error("Too big TDLib restart memory limit specified");
@@ -595,6 +596,7 @@ int main(int argc, char *argv[]) {
     parameters->memory_sampling_interval_ = 0;
     if (parameters->tdlib_restart_bot_memory_limit_ > 0) {
       LOG(ERROR) << "TDLib restart bot memory limit is ignored, because memory accounting is disabled or unsupported";
+      parameters->tdlib_restart_bot_memory_limit_ = 0;
     }
   }
 
@@ -714,6 +716,11 @@ int main(int argc, char *argv[]) {
   }
 
   LOG(WARNING) << "--------------------FINISH ENGINE--------------------";
+  // actors on other schedulers can release their references to the statistics a little later
+  auto finish_time = td::Time::now();
+  while (net_query_stats.use_count() != 1 && td::Time::now() < finish_time + 1.0) {
+    sched.run_main(0.01);
+  }
   if (net_query_stats.use_count() != 1) {
     LOG(ERROR) << "NetQueryStats have leaked";
   }

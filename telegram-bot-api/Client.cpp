@@ -8646,15 +8646,9 @@ void Client::close() {
   }
 }
 
-void Client::restart(double max_drain_time, td::Promise<td::Unit> promise) {
-  if (restart_state_ != RestartState::None) {
-    return promise.set_error(td::Status::Error(400, "Restart is already in progress"));
-  }
-  if (td_client_.empty() || !was_authorized_ || closing_ || logging_out_ || need_close_) {
-    return promise.set_error(td::Status::Error(400, "The bot isn't ready for restart"));
-  }
-  if (webhook_set_query_ || active_webhook_set_query_) {
-    return promise.set_error(td::Status::Error(400, "The webhook is being changed"));
+void Client::restart(double drain_timeout, td::Promise<td::Unit> promise) {
+  if (!can_restart()) {
+    return promise.set_error(td::Status::Error(400, "The bot can't be restarted now"));
   }
 
   LOG(WARNING) << "Start graceful restart of TDLib instance after " << tdlib_update_count_ << " updates received in "
@@ -8663,18 +8657,16 @@ void Client::restart(double max_drain_time, td::Promise<td::Unit> promise) {
   restart_promise_ = std::move(promise);
   restart_generation_++;
   restart_webhook_generation_ = webhook_generation_;
-  restart_max_drain_time_ = max_drain_time;
-  restart_deadline_ = td::Time::now() + max_drain_time;
+  restart_deadline_ = td::Time::now() + drain_timeout;
   is_webhook_paused_ = false;
 
   if (!webhook_id_.empty()) {
     // stop sending of new updates; the updates being sent must be answered by the bot before the restart, because
     // otherwise they would be sent again after the restart
     send_closure(webhook_id_, &WebhookActor::pause,
-                 td::PromiseCreator::lambda([actor_id = actor_id(this), restart_generation = restart_generation_,
-                                             webhook_generation = webhook_generation_](td::Result<td::Unit> result) {
-                   send_closure(actor_id, &Client::on_webhook_paused, restart_generation, webhook_generation,
-                                result.is_ok());
+                 td::PromiseCreator::lambda([actor_id = actor_id(this),
+                                             restart_generation = restart_generation_](td::Result<td::Unit> result) {
+                   send_closure(actor_id, &Client::on_webhook_paused, restart_generation, result.is_ok());
                  }));
   }
 
@@ -8687,7 +8679,6 @@ void Client::continue_restart(td::Promise<td::Unit> promise) {
   }
   restart_state_ = RestartState::Draining;
   restart_promise_ = std::move(promise);
-  restart_deadline_ = td::Time::now() + restart_max_drain_time_;
   check_restart();
 }
 
@@ -8695,27 +8686,19 @@ bool Client::is_restart_in_progress() const {
   return restart_state_ != RestartState::None && restart_state_ != RestartState::Closing;
 }
 
-bool Client::is_ready_for_restart_drain() const {
+bool Client::can_finish_restart_pause() const {
   // there must be no active requests and no updates being sent to the webhook
   return !long_poll_query_ && !webhook_set_query_ && !active_webhook_set_query_ &&
          (webhook_id_.empty() || is_webhook_paused_) && stat_actor_.get_actor_unsafe()->get_active_request_count() == 0;
 }
 
-bool Client::is_ready_for_restart() const {
-  // there must be no active requests, no active requests to TDLib and no partially handled updates
-  if (!cmd_queue_.empty() || !handlers_.empty() || !pending_updates_.empty() || long_poll_query_ ||
-      webhook_set_query_ || active_webhook_set_query_ || (!webhook_id_.empty() && !is_webhook_paused_)) {
-    return false;
-  }
-  if (!pending_send_message_queries_.empty() || !yet_unsent_messages_.empty() || !yet_unsent_stories_.empty() ||
-      !file_download_listeners_.empty() || !pending_bot_resolve_queries_.empty()) {
-    return false;
-  }
-  if (!new_message_queues_.empty() || !new_business_message_queues_.empty() || !new_guest_query_queues_.empty() ||
-      !new_callback_query_queues_.empty() || !new_business_callback_query_queues_.empty()) {
-    return false;
-  }
-  return stat_actor_.get_actor_unsafe()->get_active_request_count() == 0;
+bool Client::can_close_for_restart() const {
+  // additionally, there must be no requests to TDLib and no partially handled updates
+  return can_finish_restart_pause() && cmd_queue_.empty() && handlers_.empty() && pending_updates_.empty() &&
+         pending_send_message_queries_.empty() && yet_unsent_messages_.empty() && yet_unsent_stories_.empty() &&
+         file_download_listeners_.empty() && pending_bot_resolve_queries_.empty() && new_message_queues_.empty() &&
+         new_business_message_queues_.empty() && new_guest_query_queues_.empty() &&
+         new_callback_query_queues_.empty() && new_business_callback_query_queues_.empty();
 }
 
 void Client::check_restart() {
@@ -8736,7 +8719,7 @@ void Client::check_restart() {
         // answer the getUpdates request immediately; new requests are kept by the ClientManager till the restart end
         long_poll_wakeup(true);
       }
-      if (!is_ready_for_restart_drain()) {
+      if (!can_finish_restart_pause()) {
         return set_timeout_in(RESTART_CHECK_INTERVAL);
       }
 
@@ -8752,10 +8735,7 @@ void Client::check_restart() {
       if (now >= restart_deadline_) {
         return cancel_restart("active requests weren't finished in time");
       }
-      if (long_poll_query_) {
-        long_poll_wakeup(true);
-      }
-      if (!is_ready_for_restart()) {
+      if (!can_close_for_restart()) {
         return set_timeout_in(RESTART_CHECK_INTERVAL);
       }
 
@@ -8775,7 +8755,7 @@ void Client::check_restart() {
       if (now < restart_offline_check_time_) {
         return set_timeout_at(restart_offline_check_time_);
       }
-      if (!is_ready_for_restart()) {
+      if (!can_close_for_restart()) {
         // some updates were received after the last check, and their handling may require network
         LOG(INFO) << "Enable network back, because there are unhandled updates";
         restart_state_ = RestartState::Draining;
@@ -8815,10 +8795,10 @@ void Client::on_restart_network_disabled(td::uint64 restart_generation, bool is_
   set_timeout_at(restart_offline_check_time_);
 }
 
-void Client::on_webhook_paused(td::uint64 restart_generation, td::uint64 webhook_generation, bool is_ok) {
-  // if the WebhookActor was closed, then wait for webhook_closed instead
-  if (!is_ok || restart_generation != restart_generation_ || webhook_generation != webhook_generation_ ||
-      !is_restart_in_progress()) {
+void Client::on_webhook_paused(td::uint64 restart_generation, bool is_ok) {
+  // if the WebhookActor was closed, then wait for webhook_closed instead; a change of the webhook cancels the restart,
+  // so the generation of the restart identifies the webhook too
+  if (!is_ok || restart_generation != restart_generation_ || !is_restart_in_progress()) {
     return;
   }
   LOG(INFO) << "Webhook was paused before restart";
@@ -8923,9 +8903,6 @@ ServerBotInfo Client::get_bot_info() const {
 void Client::start_up() {
   CHECK(start_time_ < 1e-10);
   start_time_ = td::Time::now();
-  if (first_start_time_ <= 0.0) {
-    first_start_time_ = start_time_;
-  }
   next_bot_updates_warning_time_ = start_time_ + 600;
   webhook_set_time_ = start_time_;
   next_allowed_set_webhook_time_ = start_time_;
@@ -10455,7 +10432,7 @@ void Client::timeout_expired() {
     return check_restart();
   }
   if (!td_client_.empty()) {
-    // the timeout is used to stop the Client only after the TDLib instance is closed
+    // outside of a restart, the timeout is used only to stop the Client after the TDLib instance is closed
     return;
   }
   LOG(WARNING) << "Stop client";

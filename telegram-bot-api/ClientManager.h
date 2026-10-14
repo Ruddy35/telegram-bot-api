@@ -90,7 +90,9 @@ class ClientManager final : public td::Actor {
     bool was_authorized_ = false;
 
     // graceful restart of the TDLib instance
-    // Pausing: getUpdates queries are delayed; Draining and Closing: all queries are delayed
+    //  Pausing: getUpdates queries are delayed; the Client is in the state Pausing;
+    //  Draining: all queries are delayed; the Client is in the states Paused, Draining, GoingOffline or Offline;
+    //  Closing: all queries are delayed; the TDLib instance is being closed.
     enum class RestartState : td::int8 { None, Pausing, Draining, Closing };
     RestartState restart_state_ = RestartState::None;
     std::queue<PromisedQueryPtr> restart_queries_;  // queries received during the restart
@@ -122,8 +124,7 @@ class ClientManager final : public td::Actor {
   td::int64 last_tqueue_deleted_events_ = 0;
 
   td::uint64 restarting_client_id_ = 0;
-  bool has_restart_requests_ = false;
-  double next_restart_time_ = 0.0;
+  double next_restart_time_ = 0.0;  // cooldown of restarts
   double next_memory_check_time_ = 0.0;
   double malloc_trim_time_ = 0.0;
   td::int64 total_restart_count_ = 0;
@@ -142,8 +143,8 @@ class ClientManager final : public td::Actor {
   static td::Slice get_reject_reason_name(RejectReason reason);
   std::array<td::int64, static_cast<std::size_t>(RejectReason::Size)> rejected_queries_{};
   td::FlatHashMap<td::int32, td::int64> unauthorized_bot_requests_;  // HTTP status code -> count; for removed bots
-  td::uint64 tdlib_statistics_check_count_ = 0;
-  static constexpr td::uint64 TDLIB_STATISTICS_PERIOD = 60;  // in RESTART_CHECK_PERIOD
+  td::uint64 periodic_task_count_ = 0;
+  static constexpr td::uint64 TDLIB_STATISTICS_PERIOD = 60;  // in PERIODIC_TASK_PERIOD
 
   void add_bot_metrics(MetricsWriter &writer, const ClientInfo &client_info, double now);
 
@@ -167,10 +168,12 @@ class ClientManager final : public td::Actor {
 
   static constexpr double WATCHDOG_TIMEOUT = 0.25;
   static constexpr std::size_t MAX_RESTART_QUERIES = 10000;
-  static constexpr double RESTART_CHECK_PERIOD = 1.0;
+  static constexpr double PERIODIC_TASK_PERIOD = 1.0;
   static constexpr double RESTART_MEMORY_CHECK_PERIOD = 5.0;
   static constexpr double RESTART_RETRY_DELAY = 300.0;
-  static constexpr double MAX_RESTART_DURATION = 120.0;  // in addition to the drain timeout
+  // delayed queries are failed if a restart takes longer than the drain timeout plus this time, which is more than enough
+  // to disable network and to close and open the TDLib instance
+  static constexpr double MAX_RESTART_DURATION = 120.0;
   static constexpr double MALLOC_TRIM_DELAY = 10.0;
 
   static td::int64 get_tqueue_id(td::int64 user_id, bool is_test_dc);
@@ -186,9 +189,11 @@ class ClientManager final : public td::Actor {
 
   void create_client_actor(td::uint64 id);
 
-  void schedule_restart_check();
+  static td::string get_bot_label(const ClientInfo &client_info);
 
-  void on_restart_check_timer();
+  void schedule_periodic_tasks();
+
+  void run_periodic_tasks();
 
   double get_scheduled_restart_time(double now) const;
 
@@ -202,13 +207,13 @@ class ClientManager final : public td::Actor {
 
   void on_restart_closing(td::uint64 id, td::Result<td::Unit> result);
 
-  void cancel_restart(ClientInfo *client_info, td::uint64 id, const td::Status &error);
+  void cancel_restart(td::uint64 id, const td::Status &error);
 
   void finish_restart(td::uint64 id);
 
   void send_restart_queries(ClientInfo *client_info);
 
-  void fail_restart_queries(ClientInfo *client_info);
+  void fail_restart_queries(ClientInfo *client_info, QueryFailReason reason);
 
   static td::Slice get_restart_state_name(ClientInfo::RestartState state);
 
