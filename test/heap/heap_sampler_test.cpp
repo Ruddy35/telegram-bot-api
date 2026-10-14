@@ -5,7 +5,7 @@
 // Verification of HeapSampler: correctness of all allocation functions under concurrent use, unbiasedness and
 // variance of estimates for different size distributions, attribution to owners, absence of drift, overhead.
 //
-// Usage: heap-sampler-test [stress] [exact] [attribution] [edge] [drift] [bias] [accuracy] [overhead]
+// Usage: heap-sampler-test [stress] [exact] [attribution] [edge] [api] [limits] [drift] [bias] [accuracy] [overhead]
 //
 #include "telegram-bot-api/HeapSampler.h"
 
@@ -24,6 +24,7 @@
 #include <malloc.h>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <random>
 #include <string>
 #include <sys/wait.h>
@@ -68,7 +69,8 @@ double chunk_size(std::size_t size) {
   if (chunk < 32) {
     chunk = 32;
   }
-  if (size + 16 >= (static_cast<std::size_t>(128) << 10)) {
+  if (chunk >= (static_cast<std::size_t>(128) << 10)) {
+    // glibc allocates chunks of at least 128 KB with mmap
     return static_cast<double>((chunk + 8 + 4095) & ~static_cast<std::size_t>(4095));
   }
   return static_cast<double>(chunk);
@@ -833,6 +835,266 @@ void test_edge() {
   HeapSampler::set_sampling_interval(0);
 }
 
+// 4c. results and errors of all allocation functions, C++ operators, realloc transitions and zeroing
+void test_api() {
+  std::printf("== API: errors, C++ operators, realloc transitions, zeroing\n");
+  // volatile arguments prevent the compiler from evaluating the calls itself
+  volatile std::size_t max_size = ~static_cast<std::size_t>(0);
+  volatile std::size_t invalid_alignment = 3;
+  const std::size_t MAX_SIZE = max_size;
+
+  // errors
+  errno = 0;
+  CHECK_TEST(escape(calloc(MAX_SIZE / 2, 4)) == nullptr && errno == ENOMEM, "calloc overflow");
+  void *block = escape(malloc(100));
+  errno = 0;
+  CHECK_TEST(escape(reallocarray(block, MAX_SIZE / 2, 4)) == nullptr && errno == ENOMEM, "reallocarray overflow");
+  free(block);  // the block stays valid
+  void *result = nullptr;
+  errno = 0;
+  CHECK_TEST(posix_memalign(&result, invalid_alignment, 10) == EINVAL && posix_memalign(&result, 4, 10) == EINVAL &&
+                 errno == 0,
+             "posix_memalign with an invalid alignment");
+  CHECK_TEST(posix_memalign(&result, 64, 10) == 0 && reinterpret_cast<std::uintptr_t>(result) % 64 == 0 && errno == 0,
+             "posix_memalign");
+  free(result);
+  errno = 0;
+  CHECK_TEST(escape(aligned_alloc(invalid_alignment, 10)) == nullptr && errno == EINVAL,
+             "aligned_alloc with an invalid alignment");
+  CHECK_TEST(malloc_usable_size(nullptr) == 0, "malloc_usable_size(nullptr)");
+  block = escape(realloc(nullptr, 100));
+  CHECK_TEST(block != nullptr && malloc_usable_size(block) >= 100, "realloc(nullptr)");
+  free(block);
+
+  for (td::int64 interval : {static_cast<td::int64>(0), static_cast<td::int64>(1)}) {
+    // with the interval 1, allocations of at least 64 bytes are sampled with the probability 1 - exp(-65)
+    HeapSampler::set_sampling_interval(interval);
+    auto sample_count = HeapSampler::get_stats().sample_count;
+
+    // glibc rounds a non-power-of-2 alignment up
+    volatile std::size_t alignment_24 = 24;
+    block = escape(memalign(alignment_24, 100));
+    CHECK_TEST(block != nullptr && reinterpret_cast<std::uintptr_t>(block) % 32 == 0, "memalign(24)");
+    free(block);
+
+    // C++ operators are accounted like malloc and free; jemalloc has own operators, which don't call malloc
+    auto before = HeapSampler::get_stats().live_bytes;
+    auto *array = static_cast<char *>(escape(new char[1 << 20]));
+    array[0] = 1;
+    CHECK_TEST(HeapSampler::get_stats().live_bytes - before >= (1 << 20), "operator new[] isn't accounted");
+    delete[] array;
+    struct alignas(256) Aligned {
+      char data[300];
+    };
+    auto *aligned = static_cast<Aligned *>(escape(new Aligned()));
+    CHECK_TEST(reinterpret_cast<std::uintptr_t>(aligned) % 256 == 0, "aligned operator new");
+    delete aligned;
+    void *page_aligned = escape(::operator new(100, std::align_val_t(8192)));
+    CHECK_TEST(reinterpret_cast<std::uintptr_t>(page_aligned) % 8192 == 0, "operator new with big alignment");
+    ::operator delete(page_aligned, std::align_val_t(8192));
+    void *nothrow = escape(::operator new(16, std::nothrow));
+    CHECK_TEST(nothrow != nullptr, "nothrow operator new");
+    ::operator delete(nothrow);
+    CHECK_TEST(HeapSampler::get_stats().live_bytes == before, "operators leak %lld bytes",
+               static_cast<long long>(HeapSampler::get_stats().live_bytes - before));
+
+    // free doesn't change errno, including when sampled blocks are returned to the OS
+    for (std::size_t size :
+         {static_cast<std::size_t>(100), static_cast<std::size_t>(2) << 20, static_cast<std::size_t>(40) << 20}) {
+      block = escape(malloc(size));
+      static_cast<char *>(block)[size - 1] = 1;
+      errno = 12345;
+      free(block);
+      CHECK_TEST(errno == 12345, "free changed errno for a block of %zu bytes", size);
+    }
+
+    // calloc returns zeros for memory reused in every way: free slots, cached and released runs, committed blocks
+    for (std::size_t size :
+         {static_cast<std::size_t>(100), static_cast<std::size_t>(3000), static_cast<std::size_t>(64) << 10,
+          static_cast<std::size_t>(1) << 20, static_cast<std::size_t>(2) << 20, static_cast<std::size_t>(40) << 20}) {
+      for (int i = 0; i < 3; i++) {
+        auto *data = static_cast<unsigned char *>(escape(malloc(size)));
+        std::memset(data, 0xFF, size);
+        free(data);
+        data = static_cast<unsigned char *>(escape(calloc(1, size)));
+        std::size_t non_zero = 0;
+        for (std::size_t k = 0; k < size; k++) {
+          non_zero += data[k] != 0;
+        }
+        CHECK_TEST(non_zero == 0, "calloc of %zu bytes returned %zu non-zero bytes", size, non_zero);
+        free(data);
+      }
+    }
+    CHECK_TEST(HeapSampler::get_stats().sample_count == sample_count, "samples leak");
+  }
+
+  // realloc moves a block between small slots, page runs and the real allocator, and resizes big runs in place;
+  // a resized block belongs to the owner of the context, in which it was resized
+  HeapSampler::set_sampling_interval(1);
+  auto a = HeapSampler::create_owner();
+  auto b = HeapSampler::create_owner();
+  HeapSampler::set_context_owner(0xA100, a, 0);
+  HeapSampler::set_context_owner(0xB100, b, 0);
+  auto check_block = [](const unsigned char *data, std::size_t size, const char *step) {
+    bool is_ok = true;
+    for (std::size_t k = 0; k < size; k += 997) {
+      is_ok &= data[k] == static_cast<unsigned char>(k % 251);
+    }
+    CHECK_TEST(is_ok, "contents changed by %s", step);
+  };
+  auto fill_block = [](unsigned char *data, std::size_t size) {
+    for (std::size_t k = 0; k < size; k += 997) {
+      data[k] = static_cast<unsigned char>(k % 251);
+    }
+  };
+  auto samples = [](td::int32 owner) {
+    return HeapSampler::get_owner_stats(owner).sample_count;
+  };
+  set_context(0xA100);
+  auto *data = static_cast<unsigned char *>(escape(malloc(100)));
+  fill_block(data, 100);
+  CHECK_TEST(samples(a) == 1 && malloc_usable_size(data) == 100, "small sampled block");
+  data = static_cast<unsigned char *>(escape(realloc(data, 3000)));
+  check_block(data, 100, "small slot -> page run");
+  fill_block(data, 3000);
+  const std::size_t MB = 1 << 20;
+  data = static_cast<unsigned char *>(escape(realloc(data, MB + MB / 2)));
+  check_block(data, 3000, "page run -> bigger page run");
+  fill_block(data, MB + MB / 2);
+  auto *same = static_cast<unsigned char *>(escape(realloc(data, 2 * MB - 100)));
+  CHECK_TEST(same == data, "growth in place");
+  check_block(data, MB + MB / 2, "growth in place");
+  CHECK_TEST(samples(a) == 1, "one sample after growth");
+  set_context(0xB100);
+  same = static_cast<unsigned char *>(escape(realloc(data, MB + MB / 4)));
+  CHECK_TEST(same == data, "shrink in place");
+  check_block(data, MB + MB / 4, "shrink in place");
+  CHECK_TEST(samples(a) == 0 && samples(b) == 1, "a resized block belongs to the new context");
+  data = static_cast<unsigned char *>(escape(realloc(data, 20 * MB)));
+  check_block(data, MB + MB / 4, "page run -> 20 MB");
+  fill_block(data, 20 * MB);
+  data = static_cast<unsigned char *>(escape(realloc(data, 33 * MB)));
+  check_block(data, 20 * MB, "20 MB -> committed 33 MB");
+  HeapSampler::set_sampling_interval(0);
+  data = static_cast<unsigned char *>(escape(realloc(data, 100)));
+  check_block(data, 100, "sampled -> not sampled");
+  CHECK_TEST(samples(b) == 0, "a block, which isn't sampled anymore");
+  HeapSampler::set_sampling_interval(1);
+  data = static_cast<unsigned char *>(escape(realloc(data, 200)));
+  check_block(data, 100, "not sampled -> sampled");
+  CHECK_TEST(samples(b) == 1, "a block, which is sampled again");
+  free(data);
+  CHECK_TEST(samples(a) == 0 && samples(b) == 0, "all samples are freed");
+  set_context(0);
+
+  // freed runs keep at most 8 MB of memory
+  auto overhead_before = HeapSampler::get_stats().sampler_overhead_bytes;
+  std::vector<void *> blocks;
+  for (int i = 0; i < 20; i++) {
+    blocks.push_back(escape(malloc(MB)));
+    std::memset(blocks.back(), 1, MB);
+  }
+  for (auto p : blocks) {
+    free(p);
+  }
+  auto overhead = HeapSampler::get_stats().sampler_overhead_bytes - overhead_before;
+  CHECK_TEST(overhead <= static_cast<td::int64>(8 * MB), "sampler keeps %lld more bytes of freed memory",
+             static_cast<long long>(overhead));
+  HeapSampler::remove_context(0xA100, a);
+  HeapSampler::remove_context(0xB100, b);
+  HeapSampler::destroy_owner(a);
+  HeapSampler::destroy_owner(b);
+  HeapSampler::set_sampling_interval(0);
+}
+
+// 4d. limits: owners, contexts and threads
+void test_limits() {
+  std::printf("== limits: owners, contexts, threads\n");
+  HeapSampler::set_sampling_interval(1);
+  // returns true if an allocation in the context is attributed to the owner
+  auto is_owner = [](std::uint64_t context, td::int32 owner) {
+    auto before = HeapSampler::get_owner_stats(owner).sample_count;
+    set_context(context);
+    void *block = escape(malloc(100));
+    set_context(0);
+    bool result = HeapSampler::get_owner_stats(owner).sample_count == before + 1;
+    free(block);
+    return result;
+  };
+
+  // there are at most 65535 owners, and destroyed owners are reused
+  std::vector<td::int32> owners;
+  while (true) {
+    auto owner = HeapSampler::create_owner();
+    if (owner == 0) {
+      break;
+    }
+    owners.push_back(owner);
+  }
+  std::printf("created %zu owners\n", owners.size());
+  CHECK_TEST(owners.size() > 65000 && owners.size() <= 65535, "%zu owners", owners.size());
+  HeapSampler::destroy_owner(owners.back());
+  CHECK_TEST(HeapSampler::create_owner() == owners.back(), "a destroyed owner is reused");
+  for (auto owner : owners) {
+    HeapSampler::destroy_owner(owner);
+  }
+
+  // a full table of contexts ignores new contexts, but updates existing ones
+  auto a = HeapSampler::create_owner();
+  auto b = HeapSampler::create_owner();
+  std::vector<std::uint64_t> contexts;
+  for (std::uint64_t i = 1; i <= 50000; i++) {
+    contexts.push_back(i * 0x40);
+    HeapSampler::set_context_owner(i * 0x40, a, 0);
+  }
+  CHECK_TEST(is_owner(contexts[0], a), "registered context");
+  CHECK_TEST(is_owner(contexts.back(), 0), "a context in a full table is ignored");
+  HeapSampler::set_context_owner(contexts[0], b, 0);
+  CHECK_TEST(is_owner(contexts[0], b), "a context is updated in a full table");
+  HeapSampler::destroy_owner(b);
+  CHECK_TEST(is_owner(contexts[0], 0), "contexts of a destroyed owner are ignored");
+  for (auto context : contexts) {
+    HeapSampler::remove_context(context, a);
+  }
+  HeapSampler::remove_context(contexts[0], b);
+
+  // contexts are found after many insertions and removals
+  std::mt19937_64 rng(7);
+  std::vector<std::uint64_t> kept;
+  for (int i = 0; i < 1000; i++) {
+    kept.push_back((rng() | 1) << 4);
+    HeapSampler::set_context_owner(kept.back(), a, 0);
+  }
+  for (int i = 0; i < 200000; i++) {
+    auto context = (rng() | 1) << 4;
+    HeapSampler::set_context_owner(context, a, 1);
+    HeapSampler::remove_context(context, a);
+  }
+  int lost = 0;
+  for (std::size_t i = 0; i < kept.size(); i += 10) {
+    lost += !is_owner(kept[i], a);
+  }
+  CHECK_TEST(lost == 0, "%d contexts are lost after churn", lost);
+  for (auto context : kept) {
+    HeapSampler::remove_context(context, a);
+  }
+  HeapSampler::destroy_owner(a);
+
+  // threads after the first 4096 share an exact counter; blocks are freed by another thread
+  HeapSampler::set_sampling_interval(0);
+  auto before = HeapSampler::get_stats();
+  auto glibc_before = glibc_in_use();
+  std::vector<void *> blocks(4200);
+  for (std::size_t i = 0; i < blocks.size(); i++) {
+    std::thread([&blocks, i] { blocks[i] = escape(malloc(100 + i)); }).join();
+  }
+  check_exact_counter("4200 threads", before, glibc_before, 0);
+  for (auto p : blocks) {
+    free(p);
+  }
+  check_exact_counter("blocks of 4200 threads are freed", before, glibc_before, 0);
+}
+
 // 5. the exact counter matches glibc accounting while many blocks are alive
 void test_exact() {
   std::printf("== exact counter with 1 million live blocks\n");
@@ -924,7 +1186,7 @@ int main(int argc, char *argv[]) {
     tests.push_back(argv[i]);
   }
   if (tests.empty()) {
-    tests = {"stress", "exact", "attribution", "edge", "drift", "bias", "accuracy", "overhead"};
+    tests = {"stress", "exact", "attribution", "edge", "api", "limits", "drift", "bias", "accuracy", "overhead"};
   }
   for (auto &test : tests) {
     if (test == "stress") {
@@ -941,6 +1203,10 @@ int main(int argc, char *argv[]) {
       test_exact();
     } else if (test == "edge") {
       test_edge();
+    } else if (test == "api") {
+      test_api();
+    } else if (test == "limits") {
+      test_limits();
     } else if (test == "overhead") {
       test_overhead();
     }
