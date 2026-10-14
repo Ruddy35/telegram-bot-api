@@ -40,6 +40,35 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(values[('e', frozenset({('v', 'a"b,c\\d\n')}))], 4)
         self.assertRaises(ValueError, testlib.parse_metrics, 'a{x="1"}\n')
 
+    def test_check_page(self):
+        valid = ('# HELP a_total help\n# TYPE a_total counter\na_total{bot="1"} 1\na_total{bot="2"} 2\n'
+                 '# HELP g help\n# TYPE g gauge\ng -1.5\n'
+                 '# HELP h help\n# TYPE h histogram\nh_bucket{x="1",le="0.1"} 1\nh_bucket{x="1",le="+Inf"} 3\n'
+                 'h_sum{x="1"} 0.5\nh_count{x="1"} 3\n')
+        self.assertEqual(len(testlib.check_metrics_page(valid)), 7)
+        invalid_pages = {
+            'repeated family': valid + '# HELP g help\n# TYPE g gauge\ng 1\n',
+            'no TYPE': '# HELP g help\ng 1\n',
+            'no help': '# HELP g\n# TYPE g gauge\ng 1\n',
+            'counter without _total': '# HELP c help\n# TYPE c counter\nc 1\n',
+            'gauge with _total': '# HELP g_total help\n# TYPE g_total gauge\ng_total 1\n',
+            'unknown type': '# HELP s help\n# TYPE s summary\ns 1\n',
+            'sample of another family': '# HELP g help\n# TYPE g gauge\nf 1\n',
+            'duplicate series': '# HELP g help\n# TYPE g gauge\ng{a="1"} 1\ng{a="1"} 2\n',
+            'negative counter': '# HELP a_total help\n# TYPE a_total counter\na_total -1\n',
+            'NaN': '# HELP g help\n# TYPE g gauge\ng NaN\n',
+            'decreasing buckets': '# HELP h help\n# TYPE h histogram\nh_bucket{le="1"} 2\nh_bucket{le="+Inf"} 1\n'
+                                  'h_sum 1\nh_count 1\n',
+            'unsorted bounds': '# HELP h help\n# TYPE h histogram\nh_bucket{le="2"} 1\nh_bucket{le="1"} 1\n'
+                               'h_bucket{le="+Inf"} 1\nh_sum 1\nh_count 1\n',
+            'wrong count': '# HELP h help\n# TYPE h histogram\nh_bucket{le="+Inf"} 2\nh_sum 1\nh_count 1\n',
+            'no +Inf': '# HELP h help\n# TYPE h histogram\nh_bucket{le="1"} 1\nh_sum 1\nh_count 1\n',
+            'token': '# HELP g help\n# TYPE g gauge\ng{v="123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"} 1\n',
+        }
+        for name, page in invalid_pages.items():
+            with self.assertRaises(AssertionError, msg=name):
+                testlib.check_metrics_page(page)
+
     def test_sum(self):
         values = testlib.parse_metrics('m{bot="1",part="a"} 1\nm{bot="1",part="b"} 2\nm{bot="2",part="a"} 4\nn 8\n')
         self.assertEqual(testlib.metric_sum(values, 'm'), 7)

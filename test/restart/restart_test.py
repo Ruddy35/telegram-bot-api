@@ -7,7 +7,7 @@
 
 Network access isn't needed: the TDLib databases of test bots are marked as authorized by restart-test-fake-auth, and
 updates are added to the update queue of the server by restart-test-fake-updates. Every scenario also checks that the
-server exits with the code 0 and logs no errors.
+server exits with the code 0 and logs no errors, and every metrics page is checked by testlib.check_metrics_page.
 
 Usage:
   cmake --build <build dir> --target telegram-bot-api restart-test-fake-auth restart-test-fake-updates
@@ -330,7 +330,8 @@ def scenario_drain_timeout():
         load.finish()
         assert server.restart_count() == 0
         assert max(load.latencies) < 6, max(load.latencies)
-        assert metric_sum(server.metrics(), 'tgbotapi_tdlib_failed_restarts_total') == 1
+        time.sleep(0.5)  # wait for the last answers to be counted
+        assert metric_sum(server.check_request_metrics(), 'tgbotapi_tdlib_failed_restarts_total') == 1
         assert 'active requests weren\'t finished in time' in '\n'.join(server.log_lines())
 
 
@@ -431,6 +432,7 @@ def scenario_restart_all():
                   if 'Start graceful restart of TDLib instance of bot' in line or 'for restart in' in line]
         assert len(events) == 4 and ['Start' in line for line in events] == [True, False, True, False], events
         assert server.api('getMe')[0]['ok'] and server.api('getMe', token=TOKEN2)[0]['ok']
+        server.check_request_metrics()
 
 
 def scenario_policy():
@@ -443,6 +445,8 @@ def scenario_policy():
         wait_for(lambda: server.restart_count() >= 10, 60, 'restarts')
         last_heap = metric_sum(server.metrics(), 'tgbotapi_heap_bytes')
         load.finish()
+        time.sleep(0.5)  # wait for the last answers to be counted
+        server.check_request_metrics()
         log('heap after 2 restarts %.2f MB, after 10 restarts %.2f MB' % (first_heap / 1e6, last_heap / 1e6))
         assert last_heap < 1.1 * first_heap, 'memory leak'
         assert 'because of memory limit' in '\n'.join(server.log_lines())
