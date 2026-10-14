@@ -706,8 +706,9 @@ void test_edge() {
   for (auto p : empty_blocks) {
     // usable size of sampled empty blocks is 0; the real allocator can return page-aligned pointers
     page_aligned += (reinterpret_cast<std::uintptr_t>(p) & 4095) == 0 && malloc_usable_size(p) == 0;
-    // 0 for sampled blocks, 24 for glibc; a wrong lookup would return the size of another block
-    CHECK_TEST(malloc_usable_size(p) <= 24, "usable size of an empty block");
+    // 0 for sampled blocks, at least 24 for glibc, which can return a slightly bigger free chunk; a wrong lookup
+    // would return the size of another block
+    CHECK_TEST(malloc_usable_size(p) <= 64, "usable size of an empty block");
   }
   CHECK_TEST(page_aligned == 0, "%d empty blocks are page-aligned", page_aligned);
   for (auto p : empty_blocks) {
