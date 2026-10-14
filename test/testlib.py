@@ -42,6 +42,59 @@ def parse_metrics(text):
     return result
 
 
+_TOKEN_LIKE = re.compile(r'\d+:[A-Za-z0-9_-]{20,}')
+
+
+def check_metrics_page(text):
+    """Checks that the page is valid in the Prometheus text format, uses the naming conventions and contains no bot
+    tokens; returns parsed values. Every family must have one HELP and one TYPE line followed by all its samples;
+    histograms must have cumulative buckets ending with +Inf equal to _count."""
+    assert not _TOKEN_LIKE.search(text), 'a bot token is exported: %r' % _TOKEN_LIKE.search(text).group(0)
+    families = {}  # name -> type
+    family = family_type = None
+    histograms = {}  # (name, labels without le) -> [(le, count)]
+    values = {}
+    for line in text.splitlines():
+        if line.startswith('# HELP '):
+            family = line.split()[2]
+            assert family not in families, 'family %s is repeated' % family
+            assert len(line.split(None, 3)) == 4, 'no help for %s' % family
+            family_type = None
+            continue
+        if line.startswith('# TYPE '):
+            _, _, name, family_type = line.split()
+            assert name == family, 'TYPE of %s without HELP' % name
+            assert family_type in ('counter', 'gauge', 'histogram'), line
+            assert (family_type == 'counter') == name.endswith('_total'), 'wrong name of %s %s' % (family_type, name)
+            families[name] = family_type
+            continue
+        assert family_type is not None, 'sample without TYPE: %r' % line
+        sample = parse_metrics(line)
+        assert len(sample) == 1, line
+        (name, labels), value = sample.popitem()
+        assert (name, labels) not in values, 'duplicate series %r' % line
+        assert value == value and abs(value) != float('inf'), 'invalid value %r' % line
+        values[(name, labels)] = value
+        if family_type == 'histogram':
+            suffix = name[len(family):]
+            assert name.startswith(family) and suffix in ('_bucket', '_sum', '_count'), 'wrong name %r' % line
+            key = (family, frozenset(label for label in labels if label[0] != 'le'))
+            if suffix == '_bucket':
+                histograms.setdefault(key, []).append((dict(labels)['le'], value))
+            elif suffix == '_count':
+                buckets = histograms.get(key, [])
+                assert buckets and buckets[-1][0] == '+Inf' and buckets[-1][1] == value, 'wrong count %r' % line
+                bounds = [float(le) for le, _ in buckets]
+                assert bounds == sorted(bounds) and len(set(bounds)) == len(bounds), 'wrong buckets of %s' % name
+                counts = [count for _, count in buckets]
+                assert counts == sorted(counts), 'buckets of %s are not cumulative' % name
+        else:
+            assert name == family, 'sample %s in family %s' % (name, family)
+            if family_type == 'counter':
+                assert value >= 0, line
+    return values
+
+
 def metric_sum(values, name, **labels):
     """Returns the sum of values of the metric over all series, which have the given labels."""
     return sum(value for (metric_name, metric_labels), value in values.items()
@@ -155,9 +208,11 @@ class Server:
         """Calls an API method with the parameters; http_timeout is the time to wait for the answer."""
         return http_request(self.api_port, token, method, params, http_timeout)
 
-    def metrics(self):
-        with urllib.request.urlopen('http://127.0.0.1:%d/metrics' % self.stat_port, timeout=30) as r:
-            return parse_metrics(r.read().decode())
+    def metrics(self, query=''):
+        """Returns parsed metrics after checking the page with check_metrics_page."""
+        with urllib.request.urlopen('http://127.0.0.1:%d/metrics%s' % (self.stat_port, query), timeout=30) as r:
+            assert r.headers['Content-Type'] == 'text/plain; version=0.0.4; charset=utf-8', r.headers['Content-Type']
+            return check_metrics_page(r.read().decode())
 
     def stats(self, query=''):
         """Returns the first value of each key of the text statistics page."""

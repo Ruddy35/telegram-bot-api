@@ -104,10 +104,12 @@ set(TELEGRAM_BOT_API_SOURCE
   telegram-bot-api/BotMetrics.cpp
   telegram-bot-api/Client.cpp
   telegram-bot-api/ClientManager.cpp
+  telegram-bot-api/ClientManagerMetrics.cpp
   telegram-bot-api/CpuSampler.cpp
   telegram-bot-api/HeapSampler.cpp
   telegram-bot-api/HttpConnection.cpp
   telegram-bot-api/HttpStatConnection.cpp
+  telegram-bot-api/MetricsWriter.cpp
   telegram-bot-api/Query.cpp
   telegram-bot-api/Stats.cpp
   telegram-bot-api/Watchdog.cpp
@@ -122,6 +124,7 @@ set(TELEGRAM_BOT_API_SOURCE
   telegram-bot-api/HttpConnection.h
   telegram-bot-api/HttpServer.h
   telegram-bot-api/HttpStatConnection.h
+  telegram-bot-api/MetricsWriter.h
   telegram-bot-api/Query.h
   telegram-bot-api/Stats.h
   telegram-bot-api/Watchdog.h
@@ -142,10 +145,8 @@ endif()
 
 # accounting of memory usage of each bot replaces memory allocation functions; it requires dynamic linking with glibc
 option(TELEGRAM_BOT_API_HEAP_SAMPLING "Account memory usage of each bot by replacing memory allocation functions" ON)
-set(TELEGRAM_BOT_API_HEAP_SAMPLING_ENABLED OFF)
 if (TELEGRAM_BOT_API_HEAP_SAMPLING AND CMAKE_SYSTEM_NAME MATCHES "Linux" AND NOT MEMPROF AND
     NOT "${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_CXX_FLAGS}" MATCHES "(^| )-static( |$)")
-  set(TELEGRAM_BOT_API_HEAP_SAMPLING_ENABLED ON)
   target_compile_definitions(telegram-bot-api PRIVATE TELEGRAM_BOT_API_HEAP_SAMPLING)
   target_link_libraries(telegram-bot-api PRIVATE ${CMAKE_DL_LIBS})
 endif()

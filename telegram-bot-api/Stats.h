@@ -222,8 +222,7 @@ class BotStatActor final : public td::Actor {
   void on_event(const ServerBotStat::Response &response) {
     if (metrics_ != nullptr) {
       metrics_->on_response(response.method_id_, response.http_status_code_, response.fail_reason_, response.duration_,
-                            response.query_size_, static_cast<td::int64>(response.size_), response.file_count_,
-                            response.files_size_);
+                            response.query_size_, static_cast<td::int64>(response.size_));
     }
     active_request_count_--;
     active_file_upload_count_ -= response.file_count_;

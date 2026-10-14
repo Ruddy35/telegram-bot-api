@@ -1145,7 +1145,7 @@ class Client final : public WebhookActor::Callback {
   void do_get_file(object_ptr<td_api::file> file, PromisedQueryPtr query);
 
   bool is_file_being_downloaded(int32 file_id) const;
-  void on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file, int64 partial_size = 0);
+  void on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file);
 
   void return_stickers(object_ptr<td_api::stickers> stickers, PromisedQueryPtr query);
 

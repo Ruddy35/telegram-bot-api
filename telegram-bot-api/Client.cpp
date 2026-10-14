@@ -447,6 +447,7 @@ td::Slice Client::get_method_stat_name(td::int32 method_id) {
 }
 
 td::int32 Client::get_update_type_count() {
+  static_assert(static_cast<std::size_t>(UpdateType::Size) <= BotMetrics::MAX_UPDATE_TYPES, "");
   return static_cast<td::int32>(UpdateType::Size);
 }
 
@@ -7700,12 +7701,9 @@ class Client::TdOnDownloadFileCallback final : public TdQueryCallback {
     CHECK(result->get_id() == td_api::file::ID);
     auto file = move_object_as<td_api::file>(result);
     if (client_->is_file_being_downloaded(file_id_)) {  // if download is yet not finished
-      if (client_->download_started_file_ids_.insert(file_id_).second) {
-        if (file->local_->is_downloading_completed_) {
-          client_->cached_download_file_ids_.insert(file_id_);
-        } else {
-          client_->metrics_->on_download_started();
-        }
+      if (client_->download_started_file_ids_.insert(file_id_).second && file->local_->is_downloading_completed_) {
+        // the file has already been downloaded
+        client_->cached_download_file_ids_.insert(file_id_);
       }
     }
     client_->on_update_file(std::move(file));
@@ -9748,8 +9746,7 @@ void Client::on_update_file(object_ptr<td_api::file> file) {
       send_request(make_object<td_api::cancelDownloadFile>(file_id, false),
                    td::make_unique<TdOnCancelDownloadFileCallback>());
     }
-    return on_file_download(file_id, td::Status::Error(400, "Bad Request: file is too big"),
-                            file->local_->downloaded_size_);
+    return on_file_download(file_id, td::Status::Error(400, "Bad Request: file is too big"));
   }
   if (file->local_->is_downloading_completed_) {
     return on_file_download(file_id, std::move(file));
@@ -9758,11 +9755,11 @@ void Client::on_update_file(object_ptr<td_api::file> file) {
     // also includes all 5xx and 429 errors
     if (closing_ || logging_out_) {
       auto error = get_closing_error();
-      return on_file_download(file_id, td::Status::Error(error.code, error.message), file->local_->downloaded_size_);
+      return on_file_download(file_id, td::Status::Error(error.code, error.message));
     }
 
     auto error = td::Status::Error(400, "Bad Request: wrong file_id or the file is temporarily unavailable");
-    return on_file_download(file_id, std::move(error), file->local_->downloaded_size_);
+    return on_file_download(file_id, std::move(error));
   }
 }
 
@@ -9892,12 +9889,12 @@ void Client::update_shared_unix_time_difference() {
 }
 
 void Client::on_update(object_ptr<td_api::Object> result) {
-  tdlib_update_count_++;
-  metrics_->on_tdlib_update();
   if (!was_authorized_ && !allow_update_before_authorization(result.get())) {
     pending_updates_.push_back(std::move(result));
     return;
   }
+  tdlib_update_count_++;
+  metrics_->on_tdlib_update();
   switch (result->get_id()) {
     case td_api::updateAuthorizationState::ID: {
       auto update = move_object_as<td_api::updateAuthorizationState>(result);
@@ -10382,7 +10379,7 @@ void Client::on_closed() {
     LOG(ERROR) << "Doesn't receive updateFile for file " << file_id;
     auto queries = std::move(it->second);
     file_download_listeners_.erase(it);
-    metrics_->on_download_finished(BotMetrics::DownloadResult::Aborted, 0);
+    metrics_->on_download_finished(BotMetrics::DownloadResult::Closing, 0);
     for (auto &query : queries) {
       fail_query_closing(std::move(query));
     }
@@ -17462,7 +17459,7 @@ bool Client::is_file_being_downloaded(int32 file_id) const {
   return file_download_listeners_.count(file_id) > 0;
 }
 
-void Client::on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file, int64 partial_size) {
+void Client::on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>> r_file) {
   auto it = file_download_listeners_.find(file_id);
   if (it == file_download_listeners_.end()) {
     return;
@@ -17477,11 +17474,11 @@ void Client::on_file_download(int32 file_id, td::Result<object_ptr<td_api::file>
         is_cached ? BotMetrics::DownloadResult::Cached : BotMetrics::DownloadResult::Completed,
         td::max(file->size_, file->local_->downloaded_size_));
   } else if (closing_ || logging_out_) {
-    metrics_->on_download_finished(BotMetrics::DownloadResult::Closing, partial_size);
+    metrics_->on_download_finished(BotMetrics::DownloadResult::Closing, 0);
   } else if (td::begins_with(r_file.error().message(), "Bad Request: file is too big")) {
-    metrics_->on_download_finished(BotMetrics::DownloadResult::TooBig, partial_size);
+    metrics_->on_download_finished(BotMetrics::DownloadResult::TooBig, 0);
   } else {
-    metrics_->on_download_finished(BotMetrics::DownloadResult::Error, partial_size);
+    metrics_->on_download_finished(BotMetrics::DownloadResult::Error, 0);
   }
   for (auto &query : queries) {
     if (r_file.is_error()) {

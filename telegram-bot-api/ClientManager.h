@@ -9,6 +9,7 @@
 #include "telegram-bot-api/BotMetrics.h"
 #include "telegram-bot-api/Client.h"
 #include "telegram-bot-api/CpuSampler.h"
+#include "telegram-bot-api/MetricsWriter.h"
 #include "telegram-bot-api/Query.h"
 #include "telegram-bot-api/Stats.h"
 #include "telegram-bot-api/Watchdog.h"
@@ -24,6 +25,7 @@
 #include "td/utils/Slice.h"
 
 #include <array>
+#include <map>
 #include <memory>
 #include <queue>
 #include <utility>
@@ -130,6 +132,9 @@ class ClientManager final : public td::Actor {
   td::int64 total_restart_count_ = 0;
   td::int64 total_failed_restart_count_ = 0;
 
+  td::uint64 periodic_task_count_ = 0;
+  static constexpr td::uint64 TDLIB_STATISTICS_PERIOD = 60;  // in PERIODIC_TASK_PERIOD
+
   // metrics of queries, which weren't sent to a Client
   enum class RejectReason : td::int8 {
     Closing,
@@ -140,31 +145,35 @@ class ClientManager final : public td::Actor {
     GlobalFloodLimit,
     Size
   };
-  static td::Slice get_reject_reason_name(RejectReason reason);
   std::array<td::int64, static_cast<std::size_t>(RejectReason::Size)> rejected_queries_{};
-  td::FlatHashMap<td::int32, td::int64> unauthorized_bot_requests_;  // HTTP status code -> count; for removed bots
-  td::uint64 periodic_task_count_ = 0;
-  static constexpr td::uint64 TDLIB_STATISTICS_PERIOD = 60;  // in PERIODIC_TASK_PERIOD
+  std::map<td::int32, td::int64> unauthorized_bot_requests_;  // HTTP status code -> count; for bots removed before
+                                                              // authorization
 
-  void add_bot_metrics(MetricsWriter &writer, const ClientInfo &client_info, double now);
-
-  // statistical estimation of CPU time consumed by each bot
+  // statistical estimation of CPU time consumed by each bot; see CpuSampler
   double cpu_sampling_period_ = 0.0;  // 0 if the sampling is disabled
   td::vector<td::ActorOwn<CpuSampler>> cpu_samplers_;
   td::int64 unattributed_cpu_samples_ = 0;
-  td::vector<double> thread_cpu_times_;  // scheduler identifier -> total CPU time consumed by the thread
-  td::vector<td::int64> thread_ids_;     // scheduler identifier -> identifier of the thread in the OS
-  struct SchedulerLag {
-    td::uint64 counts[CpuSampler::LAG_BUCKET_COUNT] = {};
-    double sum = 0.0;
-    double recent_max[60] = {};  // maximum lag for each of the last 60 seconds
-    std::size_t recent_pos = 0;
+  struct ThreadStats {
+    double cpu_time = 0.0;    // total CPU time consumed by the thread
+    td::int64 thread_id = 0;  // identifier of the thread in the OS
+    td::uint64 lag_counts[CpuSampler::LAG_BUCKET_COUNT] = {};
+    double lag_sum = 0.0;
+    std::array<double, 60> recent_max_lags{};  // maximum lags between the last 60 flushes of samples, done every second
+    std::size_t recent_max_lag_pos = 0;
   };
-  td::vector<SchedulerLag> scheduler_lags_;  // scheduler identifier -> lag statistics
+  td::vector<ThreadStats> threads_;  // scheduler identifier -> statistics of the thread
 
+  // implemented in ClientManagerMetrics.cpp
   void start_cpu_sampling();
 
   void on_cpu_samples(CpuSampler::Samples samples);
+
+  static void declare_metrics(MetricsWriter &writer);
+
+  // bot_memory and bot_exact_memory are total memory of the bots listed on the page
+  void add_server_metrics(MetricsWriter &writer, double now, td::int64 bot_memory, td::int64 bot_exact_memory);
+
+  void add_bot_metrics(MetricsWriter &writer, const ClientInfo &client_info, td::Slice bot_label, double now);
 
   static constexpr double WATCHDOG_TIMEOUT = 0.25;
   static constexpr std::size_t MAX_RESTART_QUERIES = 10000;

@@ -547,7 +547,7 @@ void WebhookActor::on_update_error(td::TQueue::EventId event_id, td::Slice error
   CHECK(it->second != nullptr);
   auto &update = *it->second;
   metrics_->on_webhook_result(td::begins_with(error, "Webhook connection closed")
-                                  ? BotMetrics::WebhookResult::ConnectionError
+                                  ? BotMetrics::WebhookResult::ConnectionClosed
                                   : BotMetrics::WebhookResult::HttpError,
                               now - update.last_send_time_);
 
@@ -562,7 +562,7 @@ void WebhookActor::on_update_error(td::TQueue::EventId event_id, td::Slice error
   }
   if (parameters_->shared_data_->get_unix_time(now) + next_effective_delay > update.expires_at_) {
     LOG(WARNING) << "Drop update " << event_id << ": " << error;
-    metrics_->on_webhook_result(BotMetrics::WebhookResult::Dropped, 0.0);
+    metrics_->on_webhook_update_dropped();
     drop_event(event_id);
     return;
   }
@@ -850,7 +850,6 @@ void WebhookActor::on_error(td::Status status) {
 
 void WebhookActor::on_connection_error(td::Status error) {
   CHECK(error.is_error());
-  metrics_->on_webhook_connection_error();
   on_webhook_error(error.message());
 }
 

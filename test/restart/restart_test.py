@@ -23,6 +23,8 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.dont_write_bytecode = True
@@ -41,11 +43,12 @@ def log(*args):
 class TestServer(testlib.Server):
     """A server with test bots, which counts answered requests of the first bot and checks its exit code and log."""
 
-    def __init__(self, name, args=(), update_count=0, second_bot=False, expected_errors=()):
+    def __init__(self, name, args=(), update_count=0, second_bot=False, extra_bots=(), expected_errors=()):
         self.name = name
         work = os.path.join(WORK_ROOT, name)
         shutil.rmtree(work, ignore_errors=True)
-        testlib.prepare_work_dir(BUILD_DIR, work, testlib.BOTS if second_bot else testlib.BOTS[:1], update_count)
+        bots = (testlib.BOTS if second_bot else testlib.BOTS[:1]) + list(extra_bots)
+        testlib.prepare_work_dir(BUILD_DIR, work, bots, update_count)
         super().__init__(os.path.join(BUILD_DIR, 'telegram-bot-api'), work, args)
         self.expected_errors = expected_errors
         self.calls = collections.Counter()  # answered requests of the first bot by (method, HTTP status code)
@@ -146,19 +149,21 @@ class Load:
 
 class Hook:
     """A webhook, which answers after a delay; optionally calls API methods before answering, like many bot frameworks
-    do, and fails first requests with HTTP 500."""
+    do. First requests are failed as specified by failures: an HTTP status code or None to close the connection."""
 
-    def __init__(self, delay=0.0, server=None, fail_count=0):
+    def __init__(self, delay=0.0, server=None, failures=()):
         hook = self
         self.delay = delay
         self.server = server
-        self.fail_count = fail_count
+        self.failures = list(failures)
         self.received = collections.Counter()  # update identifier -> number of deliveries
         self.secret_tokens = set()
         self.api_errors = []
         self.lock = threading.Lock()
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'  # keep connections alive, so they are closed only on purpose
+
             def do_POST(self):
                 update = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
                 time.sleep(hook.delay)
@@ -168,11 +173,12 @@ class Hook:
                         hook.api_errors.append(result)
                 with hook.lock:
                     hook.secret_tokens.add(self.headers.get('X-Telegram-Bot-Api-Secret-Token'))
-                    status = 500 if hook.fail_count > 0 else 200
+                    status = hook.failures.pop(0) if hook.failures else 200
                     if status == 200:
                         hook.received[update['update_id']] += 1
-                    else:
-                        hook.fail_count -= 1
+                if status is None:
+                    self.close_connection = True
+                    return
                 self.send_response(status)
                 self.send_header('Content-Length', '0')
                 self.end_headers()
@@ -497,29 +503,126 @@ def scenario_options():
         assert result.returncode != 0, option
 
 
+def upload(server, method, field, content, http_timeout, **params):
+    """Calls the method with the file uploaded in the field as multipart/form-data."""
+    boundary = 'test-boundary-1234567890'
+    body = b''
+    for name, value in params.items():
+        body += ('--%s\r\nContent-Disposition: form-data; name="%s"\r\n\r\n%s\r\n' % (boundary, name, value)).encode()
+    body += ('--%s\r\nContent-Disposition: form-data; name="%s"; filename="file.bin"\r\n'
+             'Content-Type: application/octet-stream\r\n\r\n' % (boundary, field)).encode() + content + b'\r\n'
+    body += ('--%s--\r\n' % boundary).encode()
+    request = urllib.request.Request('http://127.0.0.1:%d/bot%s/%s' % (server.api_port, TOKEN, method), data=body,
+                                     headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
+    try:
+        with urllib.request.urlopen(request, timeout=http_timeout) as r:
+            return json.loads(r.read())
+    except OSError as e:
+        return {'ok': False, 'description': str(e)}
+
+
 def scenario_metrics():
-    """Failure reasons and requests abandoned by clients are counted."""
-    with TestServer('metrics', [], 3) as server:
+    """All kinds of requests, files, rejections and webhook results are counted; the page is valid, can be filtered by
+    bot and doesn't list closed bots or several tokens of the same bot."""
+    alternative_token = '%d:AAFalternativeTokenOfTheSameBot12A' % BOT_ID
+    hook = Hook(failures=[500, None])
+    try:
+        with TestServer('metrics', [], 3, second_bot=True, extra_bots=[(alternative_token, BOT_ID)]) as server:
+            # requests, failure reasons and durations
+            me = server.api('getMe')[0]['result']
+            assert server.api('unknownMethod')[0]['error_code'] == 404
+            result, _ = server.api('getUpdates')
+            assert len(result['result']) == 3, result
+
+            # webhook deliveries: the first attempts get HTTP 500 and a closed connection; the webhook can't be changed
+            # more often than once a second
+            assert server.api('setWebhook', url=hook.url)[0]['ok']
+            assert server.api('setWebhook', url=hook.url + '?b')[0]['error_code'] == 429
+            wait_for(lambda: len(hook.received) == 3, 60, 'webhook deliveries')
+
+            # files of each type; sending requires network, so the client gives up after 1 second
+            local_file = os.path.join(server.work, 'local.bin')
+            with open(local_file, 'wb') as f:
+                f.write(b'x' * 2000)
+            results = [server.api('sendDocument', http_timeout=1, chat_id=123456789, document=document)[0]
+                       for document in ['https://example.com/file.pdf', 'file://' + local_file, 'BAADBAADbadFileId']]
+            results.append(upload(server, 'sendDocument', 'document', b'y' * 1000, 1, chat_id=123456789))
+            abandoned = sum('error_code' not in result for result in results)
+            assert abandoned >= 2, results
+            for result in results:
+                if 'error_code' in result:
+                    server.calls[('senddocument', result['error_code'])] += 1
+
+            # requests rejected before reaching a bot
+            assert server.api('getMe', token='invalid')[0]['error_code'] == 401
+            assert server.api('getMe', token='bot:token')[0]['error_code'] == 421
+            assert server.api('close', token='%d:AAFnotStartedBotToken' % (BOT_ID + 1))[0]['error_code'] == 400
+
+            time.sleep(0.5)  # wait for the answers to be counted
+            values = server.check_request_metrics()
+
+            def bot_value(name, **labels):
+                return metric_sum(values, name, bot=BOT_ID, **labels)
+
+            assert bot_value('tgbotapi_bot_requests_total', method='setwebhook', code=429,
+                             reason='set_webhook_flood') == 1
+            assert bot_value('tgbotapi_bot_requests_total', method='unknown', code=404, reason='none') == 1
+            calls = sum(server.calls.values())
+            get_updates = sum(count for (method, _), count in server.calls.items() if method == 'getupdates')
+            assert bot_value('tgbotapi_bot_request_duration_seconds_count') == calls - get_updates
+            for method in {method for method, _ in server.calls}:
+                assert ('tgbotapi_bot_method_duration_seconds_total',
+                        frozenset({('bot', str(BOT_ID)), ('method', method)})) in values, method
+            assert bot_value('tgbotapi_bot_request_bytes_total', method='getme') > 0
+            assert bot_value('tgbotapi_bot_response_bytes_total', method='getme') > 0
+            assert bot_value('tgbotapi_bot_abandoned_requests_total', method='senddocument') == abandoned
+            for file_type, size in [('url', 0), ('local_path', 2000), ('file_id', 0), ('upload', 1000)]:
+                assert bot_value('tgbotapi_bot_input_files_total', method='senddocument', type=file_type) == 1, file_type
+                assert bot_value('tgbotapi_bot_input_file_bytes_total', method='senddocument', type=file_type) == size
+            for reason in ['invalid_token', 'misdirected_token', 'closed_bot']:
+                assert metric_sum(values, 'tgbotapi_rejected_requests_total', reason=reason) == 1, reason
+            assert bot_value('tgbotapi_bot_fetched_updates_total') == 3
+            deliveries = {result: bot_value('tgbotapi_bot_webhook_deliveries_total', result=result)
+                          for result in ['ok', 'http_error', 'connection_closed']}
+            assert deliveries == {'ok': 3, 'http_error': 1, 'connection_closed': 1}, deliveries
+            assert bot_value('tgbotapi_bot_webhook_response_seconds_total') > 0
+            assert bot_value('tgbotapi_bot_tdlib_updates_total') > 0
+            assert bot_value('tgbotapi_bot_info', username=me['username'], webhook=1) == 1
+            assert 0 < bot_value('tgbotapi_bot_instance_uptime_seconds') < metric_sum(values, 'tgbotapi_uptime_seconds')
+            assert metric_sum(values, 'tgbotapi_bots', state='authorized') == 1  # the second bot wasn't used yet
+
+            # the page filtered by bot contains the same series of the bot
+            filtered = server.metrics('?bot=%d' % BOT_ID)
+            assert set(filtered) == {key for key in values if ('bot', str(BOT_ID)) in key[1]}
+
+            # only the newest token of a bot is listed
+            assert server.api('getMe', token=alternative_token)[0]['ok']
+            assert server.api('getMe', token=TOKEN2)[0]['ok']
+            values = server.metrics()
+            assert metric_sum(values, 'tgbotapi_bots', state='authorized') == 3
+            assert metric_sum(values, 'tgbotapi_bot_requests_total', bot=BOT_ID) == 1
+
+            # metrics of a closed bot are removed
+            assert server.api('close', token=TOKEN2)[0]['ok']
+            wait_for(lambda: metric_sum(server.metrics(), 'tgbotapi_bots', state='authorized') == 2, 30, 'closed bot')
+            assert not [key for key in server.metrics() if ('bot', str(BOT2_ID)) in key[1]]
+    finally:
+        hook.close()
+
+
+def scenario_metrics_disabled():
+    """Without CPU and memory sampling their metrics aren't exported, and the bot memory limit is ignored."""
+    error = 'TDLib restart bot memory limit is ignored'
+    with TestServer('metrics_disabled', ['--cpu-sampling-rate=0', '--memory-sampling-interval=0',
+                                         '--tdlib-restart-bot-memory-limit=1'], expected_errors=[error]) as server:
         assert server.api('getMe')[0]['ok']
-        assert server.api('unknownMethod')[0]['error_code'] == 404
-        assert server.api('setWebhook', url='http://127.0.0.1:1/a')[0]['ok']
-        assert server.api('setWebhook', url='http://127.0.0.1:1/b')[0]['error_code'] == 429
-        assert server.api('deleteWebhook')[0]['ok']
-        # requires network, so it is never answered; the client gives up after 1 second
-        result, _ = server.api('sendDocument', http_timeout=1, chat_id=123456789,
-                               document='https://example.com/file.pdf')
-        assert not result['ok'], result
-        result, _ = server.api('getUpdates')
-        assert len(result['result']) == 3, result
-        time.sleep(0.5)
-        values = server.check_request_metrics()
-        assert metric_sum(values, 'tgbotapi_bot_requests_total', method='setwebhook', code=429,
-                          reason='set_webhook_flood') == 1
-        assert metric_sum(values, 'tgbotapi_bot_requests_total', method='unknown', code=404) == 1
-        assert metric_sum(values, 'tgbotapi_bot_abandoned_requests_total', method='senddocument') == 1
-        assert metric_sum(values, 'tgbotapi_bot_input_files_total', method='senddocument', type='url') == 1
-        assert metric_sum(values, 'tgbotapi_bot_fetched_updates_total') == 3
-        assert metric_sum(values, 'tgbotapi_bots', state='authorized') == 1
+        time.sleep(1.5)
+        names = {name for name, _ in server.metrics()}
+        assert 'tgbotapi_bot_requests_total' in names and 'tgbotapi_process_cpu_seconds_total' in names
+        prefixes = ('tgbotapi_heap_', 'tgbotapi_memory_', 'tgbotapi_cpu_', 'tgbotapi_thread_', 'tgbotapi_scheduler_',
+                    'tgbotapi_bot_cpu_', 'tgbotapi_bot_memory_')
+        assert not [name for name in names if name.startswith(prefixes)], names
+        assert any(error in line for line in server.log_lines())
 
 
 def check_cpu_metrics(values):
@@ -675,7 +778,7 @@ def scenario_memory():
 
 SCENARIOS = ['webhook', 'polling', 'polling_pending', 'drain_timeout', 'cancel_with_getupdates', 'webhook_change',
              'close_during_restart', 'shutdown_during_restart', 'restart_all', 'policy', 'policy_limits',
-             'malloc_trim', 'options', 'metrics', 'resources', 'memory']
+             'malloc_trim', 'options', 'metrics', 'metrics_disabled', 'resources', 'memory']
 
 
 def main():
@@ -693,6 +796,7 @@ def main():
                 globals()['scenario_' + name]()
                 log('scenario', name, 'PASSED')
             except Exception as e:
+                traceback.print_exc()
                 log('scenario', name, 'FAILED:', repr(e))
                 failed.append(name)
     finally:

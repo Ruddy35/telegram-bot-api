@@ -4,11 +4,13 @@
 //
 #pragma once
 
+#include "telegram-bot-api/MetricsWriter.h"
+
 #include "td/utils/common.h"
-#include "td/utils/FlatHashMap.h"
 #include "td/utils/Slice.h"
 
 #include <array>
+#include <map>
 #include <utility>
 
 namespace telegram_bot_api {
@@ -35,14 +37,16 @@ class BotMetrics {
 
   enum class UpdateResult : td::int8 { Queued, Filtered, Failed, Size };
 
-  enum class DownloadResult : td::int8 { Completed, Cached, TooBig, Error, Closing, Aborted, Size };
+  enum class DownloadResult : td::int8 { Completed, Cached, TooBig, Error, Closing, Size };
 
-  enum class WebhookResult : td::int8 { Ok, HttpError, ConnectionError, Dropped, Size };
+  enum class WebhookResult : td::int8 { Ok, HttpError, ConnectionClosed, Size };
 
   enum class CpuPart : td::int8 { Client, Tdlib, Size };
 
   // memory is accounted by HeapSampler; Updates is memory of the update queue, which isn't freed by restarts
   enum class MemoryPart : td::int8 { Client, Tdlib, Updates, Size };
+
+  static constexpr std::size_t MAX_UPDATE_TYPES = 64;
 
   BotMetrics();
   BotMetrics(const BotMetrics &) = delete;
@@ -51,16 +55,14 @@ class BotMetrics {
   BotMetrics &operator=(BotMetrics &&) = delete;
   ~BotMetrics();
 
-  static constexpr std::size_t MAX_UPDATE_TYPES = 64;
-  static constexpr std::size_t DURATION_BUCKET_COUNT = 13;
-  static constexpr double DURATION_BUCKETS[DURATION_BUCKET_COUNT] = {0.005, 0.01, 0.025, 0.05, 0.1,  0.25, 0.5,
-                                                                     1.0,   2.5,  5.0,   10.0, 30.0, 60.0};
-
+  // method_id is a result of Client::get_method_stat_id; query_size excludes uploaded files
   void on_response(td::int32 method_id, td::int32 http_status_code, QueryFailReason fail_reason, double duration,
-                   td::int64 query_size, td::int64 answer_size, td::int64 file_count, td::int64 files_size);
+                   td::int64 query_size, td::int64 answer_size);
 
+  // the HTTP connection was closed by the client before the answer was sent
   void on_query_abandoned(td::int32 method_id);
 
+  // size is 0 if unknown
   void on_input_file(td::int32 method_id, InputFileType type, td::int64 size);
 
   void on_update(td::int32 update_type, UpdateResult result);
@@ -69,10 +71,9 @@ class BotMetrics {
 
   void on_webhook_result(WebhookResult result, double response_time);
 
-  void on_webhook_connection_error();
+  void on_webhook_update_dropped();
 
-  void on_download_started();
-
+  // size is the size of the downloaded file; used only for completed downloads
   void on_download_finished(DownloadResult result, td::int64 size);
 
   void on_tdlib_update();
@@ -90,38 +91,10 @@ class BotMetrics {
   // returns false if the context isn't registered
   static bool add_cpu_samples(td::uint64 context, td::uint64 count);
 
-  struct MethodTotals {
-    td::int64 count = 0;
-    double duration = 0.0;
-    td::int64 query_bytes = 0;
-    td::int64 answer_bytes = 0;
-    td::int64 file_count = 0;
-    td::int64 file_bytes = 0;
-  };
+  td::int64 get_cpu_sample_count() const;
 
-  // key: method_id + 1, http_status_code, fail_reason
-  static std::pair<td::int32, std::pair<td::int32, QueryFailReason>> decode_request_key(td::uint64 key) {
-    return {static_cast<td::int32>(key >> 24) - 1,
-            {static_cast<td::int32>((key >> 8) & 0xFFFF), static_cast<QueryFailReason>(key & 0xFF)}};
-  }
-
-  static std::pair<td::int32, InputFileType> decode_input_file_key(td::uint64 key) {
-    return {static_cast<td::int32>(key >> 8) - 1, static_cast<InputFileType>((key & 0xFF) - 1)};
-  }
-
-  static td::Slice get_fail_reason_name(QueryFailReason reason);
-
-  static td::Slice get_input_file_type_name(InputFileType type);
-
-  static td::Slice get_update_result_name(UpdateResult result);
-
-  static td::Slice get_download_result_name(DownloadResult result);
-
-  static td::Slice get_webhook_result_name(WebhookResult result);
-
-  static td::Slice get_cpu_part_name(CpuPart part);
-
-  static td::Slice get_memory_part_name(MemoryPart part);
+  // adds the numbers of answered requests by HTTP status code
+  void add_response_counts(std::map<td::int32, td::int64> &counts) const;
 
   // estimated memory used by the bot; zeros if memory accounting is disabled
   struct MemoryStats {
@@ -135,31 +108,48 @@ class BotMetrics {
   // memory, which can be released by a restart of the TDLib instance
   td::int64 get_restartable_memory() const;
 
-  td::FlatHashMap<td::uint64, td::int64> requests_;
-  td::FlatHashMap<td::int32, MethodTotals> method_totals_;  // method_id + 1 -> totals
-  std::array<td::int64, DURATION_BUCKET_COUNT + 1> duration_buckets_{};
+  static void declare_metrics(MetricsWriter &writer);
+
+  // bot_label identifies the bot, for example, 'bot="123"'; cpu_sampling_period is 0 if CPU sampling is disabled
+  void write_metrics(MetricsWriter &writer, td::Slice bot_label, double cpu_sampling_period) const;
+
+ private:
+  static constexpr std::size_t INPUT_FILE_TYPE_COUNT = static_cast<std::size_t>(InputFileType::Size);
+  static constexpr std::size_t UPDATE_RESULT_COUNT = static_cast<std::size_t>(UpdateResult::Size);
+  static constexpr std::size_t DOWNLOAD_RESULT_COUNT = static_cast<std::size_t>(DownloadResult::Size);
+  static constexpr std::size_t WEBHOOK_RESULT_COUNT = static_cast<std::size_t>(WebhookResult::Size);
+  static constexpr std::size_t CPU_PART_COUNT = static_cast<std::size_t>(CpuPart::Size);
+  static constexpr std::size_t MEMORY_PART_COUNT = static_cast<std::size_t>(MemoryPart::Size);
+
+  struct MethodStats {
+    std::map<std::pair<td::int32, QueryFailReason>, td::int64> responses;  // (HTTP status code, fail reason) -> count
+    double duration = 0.0;
+    td::int64 query_bytes = 0;
+    td::int64 answer_bytes = 0;
+    td::int64 abandoned_count = 0;
+    std::array<td::int64, INPUT_FILE_TYPE_COUNT> input_file_counts{};
+    std::array<td::int64, INPUT_FILE_TYPE_COUNT> input_file_bytes{};
+  };
+  std::map<td::int32, MethodStats> methods_;  // method_id -> statistics
+
+  // durations of answered requests except getUpdates
+  static constexpr double DURATION_BUCKETS[] = {0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0};
+  std::array<td::uint64, sizeof(DURATION_BUCKETS) / sizeof(DURATION_BUCKETS[0]) + 1> duration_counts_{};
   double duration_sum_ = 0.0;
-  td::int64 duration_count_ = 0;
 
-  td::FlatHashMap<td::int32, td::int64> abandoned_queries_;  // method_id + 1 -> count
-
-  td::FlatHashMap<td::uint64, std::pair<td::int64, td::int64>> input_files_;  // -> (count, bytes)
-
-  std::array<std::array<td::int64, static_cast<std::size_t>(UpdateResult::Size)>, MAX_UPDATE_TYPES> updates_{};
+  std::array<std::array<td::int64, UPDATE_RESULT_COUNT>, MAX_UPDATE_TYPES> updates_{};
   td::int64 fetched_updates_ = 0;
 
-  std::array<td::int64, static_cast<std::size_t>(WebhookResult::Size)> webhook_results_{};
+  std::array<td::int64, WEBHOOK_RESULT_COUNT> webhook_results_{};
   double webhook_response_time_ = 0.0;
-  td::int64 webhook_connection_errors_ = 0;
+  td::int64 webhook_dropped_updates_ = 0;
 
-  td::int64 started_downloads_ = 0;
-  std::array<td::int64, static_cast<std::size_t>(DownloadResult::Size)> finished_downloads_{};
+  std::array<td::int64, DOWNLOAD_RESULT_COUNT> downloads_{};
   td::int64 downloaded_bytes_ = 0;
-  td::int64 partially_downloaded_bytes_ = 0;
 
   td::int64 tdlib_updates_ = 0;
 
-  std::array<td::int64, static_cast<std::size_t>(CpuPart::Size)> cpu_samples_{};
+  std::array<td::int64, CPU_PART_COUNT> cpu_samples_{};
 
   td::int32 heap_owner_ = 0;  // owner in HeapSampler or 0
 
@@ -170,38 +160,6 @@ class BotMetrics {
 
   // numbers of objects in memory of the current TDLib instance by type
   td::vector<std::pair<td::string, td::int64>> tdlib_object_counts_;
-};
-
-// Builds metrics in the Prometheus text exposition format, grouping samples by metric families
-class MetricsWriter {
- public:
-  void add(td::Slice name, td::Slice type, td::Slice help, td::Slice labels, td::int64 value);
-
-  void add(td::Slice name, td::Slice type, td::Slice help, td::Slice labels, double value);
-
-  // adds a sample with the name <family name><suffix>, for example, a histogram bucket
-  void add_sample(td::Slice name, td::Slice suffix, td::Slice type, td::Slice help, td::Slice labels, td::int64 value);
-
-  void add_sample(td::Slice name, td::Slice suffix, td::Slice type, td::Slice help, td::Slice labels, double value);
-
-  td::string finish();
-
-  static td::string escape_label_value(td::Slice value);
-
- private:
-  struct Family {
-    td::string name;
-    td::string type;
-    td::string help;
-    td::string samples;
-  };
-  td::vector<Family> families_;
-  td::FlatHashMap<td::string, std::size_t> family_indexes_;
-
-  td::string &get_samples(td::Slice name, td::Slice type, td::Slice help);
-
-  void add_sample_value(td::Slice name, td::Slice suffix, td::Slice type, td::Slice help, td::Slice labels,
-                        td::Slice value);
 };
 
 }  // namespace telegram_bot_api
