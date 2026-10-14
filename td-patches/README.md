@@ -1,43 +1,41 @@
-# Патчи TDLib
+# Patches of TDLib
 
-Здесь лежат изменения исходников TDLib (`td/`), которые нужны серверу. Submodule `td` указывает на
-оригинальный коммит TDLib, а патчи применяются к нему при сборке.
+The server needs small changes of TDLib sources (`td/`). The submodule `td` points to the original commit of TDLib,
+and the patches are applied to it when the build is configured.
 
-| Патч | Что делает |
+| Patch | Changes |
 |---|---|
-| `0001-memory-object-counts.patch` | Метод `getMemoryObjectCounts`: число файлов, чатов, сообщений, пользователей, медиа и т. п. в памяти инстанса. Разрешает ботам `getStorageStatisticsFast`. Нужен для метрик `tgbotapi_bot_tdlib_objects` и `tgbotapi_bot_storage_*` (`METRICS.md`). `log_size` в ответе `getStorageStatisticsFast` — размер общего лога сервера, поэтому в метрики бота он не попадает |
+| `0001-memory-object-counts.patch` | Adds the method `getMemoryObjectCounts`, which returns the numbers of files, chats, messages, users, media and other objects in memory of an instance, and allows bots to use `getStorageStatisticsFast`. Needed for the metrics `tgbotapi_bot_tdlib_objects`, `tgbotapi_bot_storage_bytes` and `tgbotapi_bot_storage_files` |
 
-Патч только читает размеры контейнеров и ведёт один счётчик загруженных сообщений. Кроме
-разрешения `getStorageStatisticsFast` для ботов, поведение TDLib он не меняет.
+The patch only reads sizes of containers and maintains a counter of loaded messages. Except for allowing
+`getStorageStatisticsFast` for bots, it doesn't change behavior of TDLib.
 
-## Как применяется
+## How the patches are applied
 
-CMake на этапе конфигурации применяет каждый `*.patch` по порядку через `git apply`. Уже
-применённый патч пропускается, поэтому повторный запуск CMake ничего не меняет. Если патч не
-накладывается, конфигурация останавливается с ошибкой.
+CMake applies every `*.patch` in the order of names with `git apply` during configuration. An already applied patch
+is skipped, so CMake can be run again. If a patch can't be applied, the configuration fails.
 
-После этого `git status` показывает submodule `td` как изменённый — так и должно быть.
+After that `git status` shows the submodule `td` as modified, which is expected.
 
-Нужен `git`. Патчи применяются через отдельный пустой git-каталог в каталоге сборки, поэтому
-работают одинаково, если `td` — submodule, обычная папка или копия без родительского `.git`
-(например, после `COPY .` в Docker).
+`git` is needed. The patches are applied with a separate empty git directory in the build directory, so they are
+applied in the same way whether `td` is a submodule, a plain directory or a copy without the parent `.git`, for
+example, after `COPY .` in Docker.
 
-Если `git` в окружении сборки нет, примените патчи вручную и передайте CMake
-`-DTELEGRAM_BOT_API_APPLY_TD_PATCHES=OFF`:
+Without `git` apply the patches manually and pass `-DTELEGRAM_BOT_API_APPLY_TD_PATCHES=OFF` to CMake:
 
 ```
 cd td && for p in ../td-patches/*.patch; do patch -p1 < "$p"; done
 ```
 
-Патчи проверяются только при запуске CMake. Если откатить изменения в `td/`, запустите CMake
-снова, иначе сборка упадёт на отсутствующем `getMemoryObjectCounts`.
+The patches are checked only when CMake runs. If changes in `td/` are reverted, run CMake again; otherwise the build
+fails because of the missing `getMemoryObjectCounts`.
 
-## Обновление TDLib
+## Updating TDLib
 
-1. Откатите патчи: `git -C td checkout .`
-2. Обновите submodule, как обычно.
-3. Запустите CMake. Если патч не наложился, поправьте изменения в `td/` вручную и пересоздайте патч,
-   сохранив описание в начале файла:
+1. Revert the patches: `git -C td checkout .`
+2. Update the submodule as usual.
+3. Run CMake. If a patch can't be applied, change `td/` manually and recreate the patch, keeping the description at
+   its beginning:
 
    ```
    git -C td diff > /tmp/diff && { sed '/^diff --git/,$d' td-patches/0001-memory-object-counts.patch; cat /tmp/diff; } > /tmp/patch \

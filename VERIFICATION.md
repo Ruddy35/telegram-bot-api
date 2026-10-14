@@ -1,332 +1,254 @@
-# Как проверить учёт памяти по ботам
+# Verification
 
-Учёт памяти по ботам ([METRICS.md](METRICS.md#память)) делает два утверждения:
-
-1. **Точность.** Оценка памяти бота `tgbotapi_bot_memory_bytes` несмещённая, а её погрешность —
-   ровно та, что сервер сам сообщает в `tgbotapi_bot_memory_error_bytes` (стандартное отклонение σ):
-   настоящее значение отличается от оценки не больше чем на 1σ, 2σ и 3σ в 68%, 95% и 99,7% случаев.
-2. **Безвредность.** Учёт не добавляет сбоев, задержек ответов и зависаний потоков сервера.
-
-Ниже — почему это так (доказательство), чем это проверено (с цифрами и командами для повторения) и
-как проверить это на своём сервере с реальными ботами.
-
-## Итог
-
-| Что проверяется | Чем | Результат |
-|---|---|---|
-| Точный общий счётчик совпадает с аллокатором | `heap-sampler-test exact stress drift`, glibc и jemalloc | до байта, на 1 млн живых блоков и 20 млн операций |
-| Оценка несмещённая | `heap-sampler-test bias`: 5 распределений размеров × 200 независимых куч, glibc и jemalloc | среднее z в пределах ±0,12 при допуске ±0,21 |
-| Заявленная σ совпадает с фактической | то же | дисперсия, которую сообщает сервер, / теоретическая = 0,996–1,001; в ±1/2/3σ попадает 60–77% / 92–98,5% / 98,5–100% |
-| Эталон для проверки (режим проверки) точен | то же с `TELEGRAM_BOT_API_MEMORY_AUDIT=1` | до байта на 1000 кучах |
-| То же на настоящем сервере с ботами | `test/verify/verify_memory_accuracy.py offline`: 200 независимых запусков сервера в режиме проверки | 303 наблюдения; в ±1/2/3σ — 65–75% / 95–96% / 99%; среднее z +0,03 и −0,10 при допуске ±0,28 и ±0,22 |
-| Нет сбоев | стресс всех функций выделения памяти в 8 потоках; A/B под нагрузкой | 0 повреждений; 0 ошибок из 1 080 080 запросов |
-| Нет задержек и зависаний | `test/verify/latency_ab.py --concurrent=1`: сервер без учёта и сервер с учётом одновременно, 40 раундов | рост p50/p99/p99,9 больше +0,01/+0,02/+0,3 мс исключён с вероятностью 95%; задержек > 10 мс по вине сервера — 43 против 46 |
-| Цена | то же | CPU +2 мкс на запрос (+1,6%), RSS +1,1 МБ |
-
-## 1. Почему оценка точна: доказательство
-
-**Выборка.** Каждый поток считает выделенные байты. Отбор устроен как пуассоновский процесс с
-интенсивностью 1/T на оси байтов (T — `--memory-sampling-interval`, 64 КБ): до следующей «метки»
-остаётся экспоненциально распределённое число байтов, выделение размера n занимает на оси n + 1
-байтов (+1, чтобы и пустые выделения могли попасть в выборку) и отбирается, если на него попала
-метка. Отрезки разных выделений не пересекаются, а у пуассоновского процесса числа меток на
-непересекающихся отрезках независимы, поэтому выделения отбираются **независимо** друг от друга с
-вероятностью
-
-    p = 1 − exp(−(n + 1) / T).
-
-После отбора отсчёт начинается заново с новой экспоненциальной величиной; из-за отсутствия памяти у
-экспоненциального распределения это тот же пуассоновский процесс.
-
-**Оценка.** Пусть у бота живы выделения i с размерами блоков c_i (размер, который занимает блок у
-настоящего аллокатора, — те же единицы, что у точного счётчика). Отобранный блок учитывается с весом
-w_i = c_i / p_i. Оценка — сумма весов живых отобранных блоков:
-
-    X̂ = Σ I_i · c_i / p_i,  где I_i = 1, если блок отобран.
-
-Это оценка Хорвица — Томпсона: E[X̂] = Σ p_i · c_i / p_i = Σ c_i = X, то есть **оценка
-несмещённая** при любых размерах. Освобождение вычитает ровно тот вес, который был добавлен
-(отобранные блоки лежат в отдельном диапазоне адресов, и `free` узнаёт их по адресу), поэтому оценка
-в любой момент — это оценка Хорвица — Томпсона для множества живых в этот момент блоков, без
-накопления ошибки. Какие блоки освобождаются, от выборки не зависит: отобранный блок для программы
-ничем не отличается от обычного.
-
-**Погрешность.** Слагаемые независимы, поэтому
-
-    Var X̂ = Σ c_i² · (1 − p_i) / p_i.
-
-Сервер не может посчитать эту сумму (он не знает неотобранных блоков), но может её несмещённо
-оценить по отобранным:
-
-    V̂ = Σ I_i · w_i · (w_i − c_i),   E[V̂] = Σ p_i · (c_i/p_i) · (c_i/p_i − c_i) = Σ c_i² (1 − p_i) / p_i.
-
-Именно `sqrt(V̂)` сервер и экспортирует как `tgbotapi_bot_memory_error_bytes` (сумма `V̂` хранится
-по каждому боту точно, в 128-битном целом, и меняется при каждом отборе и освобождении).
-
-**Сколько это в процентах.** Для блоков намного меньше T вклад в дисперсию c²(1 − p)/p ≈ T·c·c/(n+1),
-блоки намного больше T отбираются почти всегда и почти не дают погрешности. Поэтому
-
-    σ ≈ sqrt(κ · T · X),   σ / X ≈ sqrt(κ · T / X),
-
-где κ ≥ 1 — среднее по объёму отношение c / (n + 1), то есть учёт служебных байтов блока, обычно
-1–1,5. При T = 64 КБ и κ = 1:
-
-| Память бота | σ / X | 3σ / X |
-|---|---|---|
-| 20 МБ | 5,7% | 17% |
-| 100 МБ | 2,6% | 7,7% |
-| 500 МБ | 1,1% | 3,4% |
-| 2 ГБ | 0,6% | 1,7% |
-
-**Распределение ошибки.** X̂ — сумма многих независимых ограниченных слагаемых (вес отобранного
-блока не больше примерно 32·T), поэтому при σ, много большей T, она по центральной предельной
-теореме распределена почти нормально: в ±1σ, ±2σ, ±3σ попадает 68,3%, 95,4%, 99,7% случаев. Без
-всяких предположений о распределении неравенство Чебышёва гарантирует попадание в ±3σ не реже чем в
-89% случаев. Если отобрано мало блоков (`tgbotapi_bot_memory_samples` меньше ~100), сама V̂ оценена
-грубо, а ошибка чаще в сторону недооценки: в ±3σ попадает около 98% вместо 99,7%. Меньше 30 —
-такие оценки проверка не учитывает.
-
-**Что статистикой не является.** Чей блок — определяется точно, а не выборкой: блок принадлежит
-боту, в actor-контексте которого он выделен, до самого освобождения. Это правило проверяется режимом
-проверки (ниже), где каждое выделение помечено владельцем. Общий объём кучи `tgbotapi_heap_bytes`
-считается точно. Вне учёта — память, которую аллокатор держит свободной, стеки потоков и код:
-`tgbotapi_process_resident_memory_bytes − tgbotapi_heap_bytes`.
-
-## 2. Чем точность проверена
-
-### Модельные кучи: `heap-sampler-test`
+This document lists the claims about the changes of the fork, and for each claim how it is proven or tested, the
+command to repeat the check and the result. All tests run without network access.
 
 ```
-cmake --build <build> --target heap-sampler-test
-<build>/heap-sampler-test                       # все тесты, glibc
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 <build>/heap-sampler-test
-TELEGRAM_BOT_API_MEMORY_AUDIT=1 <build>/heap-sampler-test stress attribution edge bias
+test/run_all.sh <build dir>   # all tests below except the long experiments; prints ALL TESTS PASSED
 ```
 
-Тест `bias` строит 200 независимых куч для каждого из 5 распределений размеров (мелкие 0–63 байта,
-смешанные, тяжёлый хвост Парето, размеры около шага выборки, другой шаг) и для каждой сравнивает
-оценку с точным значением, которое тест знает сам:
+| Claim | Evidence | Command | Result |
+|---|---|---|---|
+| A graceful restart doesn't fail requests, lose or duplicate updates, or change the webhook | Integration scenarios with a real server | `test/restart/restart_test.py` | All outcomes below pass |
+| Every answered request of a bot is counted exactly once, and the metrics page is valid | Scenarios compare the counted requests with the requests answered to the test; every page read by the tests is validated | `test/restart/restart_test.py` | Pass |
+| The total heap size is counted exactly | Comparison with statistics of glibc and jemalloc | `heap-sampler-test exact stress drift limits` | Equal to the byte |
+| The memory estimate of a bot is unbiased and its reported standard deviation σ is right | A proof below; 1000 independent model heaps; 200 independent real servers | `heap-sampler-test bias`, `verify_memory_accuracy.py offline` | Mean z within ±0.15 and coverage of 2σ 94.5-98% on model heaps; 93.8-95.2% on real servers |
+| Memory accounting doesn't break allocations | Concurrent stress of all allocation functions with pattern checks; all results and errors of each function | `heap-sampler-test stress api edge limits` | 0 errors with glibc and jemalloc, in the normal and audit modes |
+| Memory accounting doesn't add latency or stalls | Concurrent A/B test of the server with and without memory accounting | `latency_ab.py` | No failures of 1080120 requests; an increase of p50, p99 and p99.9 latency is rejected; +0.9% CPU time per request |
+| Documentation describes the code | All declared metrics are documented; all documented options exist | `test/test_docs.py` | Pass |
 
-- среднее z = (оценка − точное) / теоретическая σ должно быть в пределах ±3/√200 = ±0,21 — нет
-  смещения; стандартное отклонение z — от 0,8 до 1,2 — теоретическая σ верна;
-- средняя V̂, которую сообщает сервер, должна совпадать с теоретической дисперсией с точностью 10%;
-- точное значение должно попадать в ±1/2/3 σ, сообщённых сервером, не реже 58/90/98% (нормальное
-  распределение даёт 68,3/95,4/99,7%, допуск — на случайный разброс 200 испытаний);
-- в режиме проверки точный объём владельца должен совпасть с тестовым до байта.
+## Graceful restarts
 
-Результаты (glibc; на jemalloc и в режиме проверки — так же):
+`test/restart/restart_test.py <build dir> [scenario]...` runs a real server for every scenario. Test bots are marked as
+authorized in their databases by `restart-test-fake-auth`, and updates are added to the update queue by
+`restart-test-fake-updates`. Every scenario checks that the server exits with the code 0 and logs no errors; 11
+scenarios also check that the server counted exactly the requests of the first bot, which were answered to the test,
+for example, 80460 requests during 10 restarts in `policy`.
+
+| Scenario | Outcome |
+|---|---|
+| `webhook` | 3 restarts while 300 updates are delivered to a webhook with 10 connections, which calls an API method before answering, under a load of requests: every update is delivered exactly once, none of about 23000 requests fails and the slowest takes 0.52 seconds, the webhook parameters and the secret token are kept |
+| `polling` | An active long polling request is answered immediately; polling continues after the restart |
+| `polling_pending` | Updates, which weren't confirmed before the restart, and `getUpdates` requests delayed by the restart are served by the new instance: every update is received exactly once and in order |
+| `drain_timeout` | A request, which can't finish, prevents the restart: the restart is cancelled after the timeout, nothing is delayed, the bot works |
+| `cancel_with_getupdates` | A `getUpdates` request delayed by a cancelled restart is answered by the old instance |
+| `webhook_change` | `setWebhook` during a restart cancels it; no update is delivered twice |
+| `close_during_restart` | `close` during a restart cancels it; delayed requests are answered |
+| `shutdown_during_restart` | The server is stopped during a restart: it exits in time, delayed requests are answered |
+| `restart_all` | `?restart=all` restarts all bots one by one, one at a time |
+| `policy` | Restarts because of the memory limit and the uptime; the heap after 10 restarts is within 10% of the heap after 2 |
+| `policy_limits` | The minimum uptime and the cooldown are respected |
+| `malloc_trim` | Free memory is returned to the OS once after restarts |
+| `options` | Invalid values of all new options are rejected |
+| `metrics` | Requests by status code and reason, request durations except `getUpdates`, all types of input files, abandoned requests, rejected requests, webhook deliveries by result, filtering by bot, removal of a closed bot, a single series for several tokens of a bot |
+| `metrics_disabled` | Without CPU and memory sampling their metrics aren't exported, and the bot memory limit is ignored with an error |
+| `resources` | CPU time of bots and threads adds up to the CPU time of the process and continues after restarts; disk usage, disk I/O and TDLib object counts are exported |
+| `memory` | Memory of each bot is estimated within 5σ of the exact heap, attributed to the right bot, and the bot memory limit restarts only the bot, which exceeds it, without memory leaks |
+
+The offline tests can't cover what needs Telegram servers: receiving of new updates from TDLib, downloading and sending
+of files, `getDifference` after reopening of an instance, and cancellation of a restart because updates arrived after
+network was disabled. They don't cover two safety limits, which can't be reached in a test of reasonable size: 10000
+delayed requests and a restart lasting longer than the drain timeout plus 120 seconds.
+
+## Memory accounting
+
+### Why the estimate is right
+
+**Sampling.** Each thread counts allocated bytes. Sampling is a Poisson process with the rate `1/T` on the axis of
+allocated bytes, where `T` is `--memory-sampling-interval`: the number of bytes until the next sample is exponentially
+distributed. An allocation of `n` bytes takes `n + 16` bytes of the axis and is sampled if a sample point falls into
+it. Numbers of points of a Poisson process in disjoint segments are independent, so allocations are sampled
+**independently** with the probability
+
+    p = 1 - exp(-(n + 16) / T)
+
+The 16 extra bytes approximate the header of a chunk, so even empty allocations can be sampled, and the weight of a
+small allocation, defined below, is close to `T`. With `n + 1` instead, an empty allocation in a 32-byte chunk would
+have the weight `32 T`; such rare heavy samples make the estimate skewed, and the interval of ±2 reported σ contained
+the real value only in about 90% of model heaps of tiny allocations instead of 95%.
+
+**Estimate.** Let a bot have live allocations `i` with sizes `c_i` of their chunks in the real allocator, which are the
+units of the exact counter. A sampled allocation has the weight `w_i = c_i / p_i`. The estimate is the sum of the
+weights of live sampled allocations:
+
+    X̂ = Σ I_i c_i / p_i, where I_i = 1 if the allocation is sampled
+
+This is the Horvitz-Thompson estimator: `E[X̂] = Σ p_i c_i / p_i = Σ c_i = X`, so the estimate is **unbiased** for any
+sizes. A freed allocation subtracts exactly the weight, which was added (sampled allocations are placed in a reserved
+address range, so `free` recognizes them by the address). Which allocations are freed doesn't depend on the sampling,
+so at any moment the estimate is the Horvitz-Thompson estimate of the set of live allocations, without accumulation of
+errors.
+
+**Error.** The terms are independent, so
+
+    Var X̂ = Σ c_i² (1 - p_i) / p_i
+
+The server doesn't know allocations, which weren't sampled, but estimates the variance without bias from the sampled
+ones:
+
+    V̂ = Σ I_i w_i (w_i - c_i),   E[V̂] = Σ p_i (c_i / p_i) (c_i / p_i - c_i) = Var X̂
+
+`sqrt(V̂)` is exported as `tgbotapi_bot_memory_error_bytes`. For allocations much smaller than `T` the term is about
+`T c² / (n + 16) ≈ T c`, and allocations much bigger than `T` are almost always sampled and add almost no error, so
+`σ ≈ sqrt(T X)`:
+with `T = 64 KB` the relative error σ / X is 5.7% for 20 MB, 2.6% for 100 MB, 1.1% for 500 MB and 0.6% for 2 GB.
+
+**Distribution.** `X̂` is a sum of many independent bounded terms, so by the central limit theorem it is almost
+normal if σ is much bigger than `T`: the real value is within 1σ, 2σ and 3σ of the estimate in 68.3%, 95.4% and 99.7%
+of cases. Without assumptions about the distribution Chebyshev's inequality guarantees at least 89% within 3σ. With
+few sampled allocations (`tgbotapi_bot_memory_samples` below about 100) `V̂` itself is rough, and errors are more often
+underestimates.
+
+**What isn't statistical.** The owner of an allocation is determined exactly: an allocation belongs to the bot, in
+whose actor context it was made, until it is freed. The audit mode, in which every allocation is marked with its owner,
+checks this rule. The total heap size `tgbotapi_heap_bytes` is exact.
+
+### Model heaps: `heap-sampler-test`
 
 ```
-tiny sizes 0-63                 64 KB, 200 heaps of 20 MB: z mean +0.079, z stddev 1.05
-                                reported sigma: variance / theoretical 0.998, within 1/2/3 sigma: 65.5%/95.0%/99.5%
-mixed sizes                     64 KB, 200 heaps of 50 MB: z mean +0.028, z stddev 1.04
-                                reported sigma: variance / theoretical 1.001, within 1/2/3 sigma: 67.0%/94.5%/100.0%
-mixed sizes                    256 KB, 200 heaps of 50 MB: z mean -0.065, z stddev 1.09
-                                reported sigma: variance / theoretical 0.996, within 1/2/3 sigma: 67.0%/92.0%/99.0%
-heavy-tailed sizes (Pareto 1.1) 64 KB, 200 heaps of 50 MB: z mean -0.000, z stddev 1.05
-                                reported sigma: variance / theoretical 0.999, within 1/2/3 sigma: 65.0%/94.5%/98.5%
-sizes 0-200 KB around interval  64 KB, 200 heaps of 200 MB: z mean -0.113, z stddev 1.07
-                                reported sigma: variance / theoretical 0.999, within 1/2/3 sigma: 61.5%/94.5%/100.0%
+cmake --build <build dir> --target heap-sampler-test
+<build dir>/heap-sampler-test [test]...
+LD_PRELOAD=<path to libjemalloc.so.2> <build dir>/heap-sampler-test [test]...
+TELEGRAM_BOT_API_MEMORY_AUDIT=1 <build dir>/heap-sampler-test [test]...
 ```
 
-Остальные тесты: `exact` — точный счётчик равен статистике аллокатора (`mallinfo2` у glibc,
-`stats.allocated` у jemalloc) до байта на 1 млн живых блоков; `drift` — после 20 млн операций и
-освобождения всего оценка ровно 0; `attribution` — блоки остаются за владельцем при освобождении из
-другого контекста и потока, память удалённых владельцев переходит в неатрибутированную; `accuracy` —
-то же при постоянном выделении и освобождении в 4 потоках.
+| Test | Checks |
+|---|---|
+| `stress` | 8 threads call all allocation functions with sampling every 4 KB; contents of every block are checked by a pattern, `calloc` by zeros, alignment and `malloc_usable_size` by their contracts; the exact counter equals the allocator statistics after all threads finish |
+| `exact` | The exact counter equals `mallinfo2` of glibc or `stats.allocated` of jemalloc with a million live blocks |
+| `attribution` | Blocks stay with their owner when freed by another thread in another context; `realloc` moves a block to the current owner; parts; the last registration of a context wins; memory of destroyed owners becomes unattributed |
+| `edge` | Empty and huge blocks, failed allocations, lazily committed big blocks, disabled sampling, reuse of owner slots, `fork` during sampling |
+| `api` | Results and `errno` of every function on errors, all forms of `operator new` and `delete`, zeroing on every reuse path, all `realloc` transitions, the size of the cache of freed runs |
+| `limits` | 65535 owners, a full table of contexts, 200000 context changes, 4200 threads |
+| `drift` | After 20 million operations and freeing of everything the estimate is exactly 0 and the exact counter has no drift |
+| `bias` | 200 independent heaps for each of 5 distributions of sizes: mean z = (estimate - exact) / σ within ±3/√200, standard deviation of z between 0.8 and 1.2, mean `V̂` within 10% of the theoretical variance, coverage of 1σ, 2σ, 3σ at least 58%, 90%, 98%; exact owner memory in the audit mode |
+| `accuracy` | The same with continuous allocation and freeing in 4 threads |
+| `overhead` | Cost of a pair of `malloc` and `free` with and without sampling |
 
-### Настоящий сервер: `verify_memory_accuracy.py offline`
+Results of `bias` with glibc:
 
 ```
-cmake --build <build> --target telegram-bot-api restart-test-fake-auth restart-test-fake-updates
-python3 test/verify/verify_memory_accuracy.py offline <build> --runs=100 --intervals=64,16 --csv=accuracy.csv
+tiny sizes 0-63                    interval   64 KB, 200 heaps of 20 MB: mean error -0.476%, z mean -0.081 (must be within +-0.21), z stddev 1.00
+                                   reported sigma: variance / theoretical 0.994, exact value within 1/2/3 sigma: 72.0%/95.0%/99.5%
+mixed sizes                        interval   64 KB, 200 heaps of 50 MB: mean error +0.083%, z mean +0.023 (must be within +-0.21), z stddev 0.90
+                                   reported sigma: variance / theoretical 1.001, exact value within 1/2/3 sigma: 72.5%/97.0%/100.0%
+mixed sizes                        interval  256 KB, 200 heaps of 50 MB: mean error -0.149%, z mean -0.021 (must be within +-0.21), z stddev 0.98
+                                   reported sigma: variance / theoretical 0.998, exact value within 1/2/3 sigma: 68.5%/94.5%/100.0%
+heavy-tailed sizes (Pareto 1.1)    interval   64 KB, 200 heaps of 50 MB: mean error -0.003%, z mean +0.010 (must be within +-0.21), z stddev 0.90
+                                   reported sigma: variance / theoretical 0.999, exact value within 1/2/3 sigma: 73.5%/97.0%/100.0%
+sizes 0-200 KB around the interval interval   64 KB, 200 heaps of 200 MB: mean error +0.065%, z mean +0.062 (must be within +-0.21), z stddev 0.99
+                                   reported sigma: variance / theoretical 1.001, exact value within 1/2/3 sigma: 70.5%/94.5%/100.0%
 ```
 
-Сеть не нужна. Каждый запуск — новый процесс сервера в режиме проверки с двумя тестовыми ботами;
-каждый бот получает случайное число (от 10 до 20 000) запросов `sendMessage` случайного размера,
-которые без сети остаются в памяти его TDLib-инстанса и клиента; в половине запусков TDLib-инстанс
-первого бота перед этим перезапускается. Когда сервер всё обработал, скрипт сравнивает
-`tgbotapi_bot_memory_bytes` с `tgbotapi_bot_memory_exact_bytes`. Запуски независимы (новая случайная
-выборка), поэтому все наблюдения независимы, и проверки строгие: покрытие ±1/2/3σ не ниже
-нормального минус 3 стандартных отклонения биномиального разброса, среднее z в пределах ±3/√n,
-стандартное отклонение z не больше 1 + 3/√(2n). Сырые наблюдения сохраняются в CSV.
+All tests pass with glibc and jemalloc, in the normal and audit modes. Over these 20 combinations of a distribution and
+a mode mean z is between -0.15 and +0.06, the standard deviation of z is between 0.90 and 1.05, the mean reported
+variance is 0.992-1.002 of the theoretical one, and the exact value is within 1σ, 2σ, 3σ of the estimate in
+62-73.5%, 94.5-98% and 99-100% of heaps.
 
-Результаты (100 запусков на каждый шаг выборки; учитывались боты, у которых отобрано хотя бы 30
-блоков):
+### Real servers: `verify_memory_accuracy.py offline`
 
-| Шаг | Наблюдений | В ±1σ | В ±2σ | В ±3σ | Среднее z | Ст. откл. z | Суммарная ошибка |
+```
+python3 test/verify/verify_memory_accuracy.py offline <build dir> --runs=100 --intervals=64,16 --csv=accuracy.csv
+```
+
+Each run is a new server process in the audit mode with two test bots. Each bot gets a random number (10-20000) of
+`sendMessage` requests with random sizes, which stay in memory of its TDLib instance and client without network; in
+half of the runs the TDLib instance of the first bot is restarted before. Then the estimates are compared with the
+exact values. Runs are independent, so all observations are independent, and the checks are strict: the coverage of
+1σ, 2σ, 3σ must be at least the normal one minus 3 standard deviations of the binomial distribution minus 1%, mean z
+must be within ±3/√n, the standard deviation of z must be at most 1 + 3/√(2n) + 0.05, and the estimate of the whole
+heap must be within 4σ in every run.
+
+Results of 100 runs for each interval (bots with at least 30 expected samples):
+
+| Interval | Observations | Within 1σ | Within 2σ | Within 3σ | Mean z | Standard deviation of z | Total error |
 |---|---|---|---|---|---|---|---|
-| 64 КБ | 119 | 74,8% | 95,0% | 99,2% | +0,03 (допуск ±0,28) | 0,92 | +0,9% от 559 МБ |
-| 16 КБ | 184 | 65,2% | 95,7% | 98,9% | −0,10 (допуск ±0,22) | 1,06 | −0,4% от 713 МБ |
-| нормальное распределение | | 68,3% | 95,4% | 99,7% | 0 | 1 | |
+| 64 KB | 167 | 64.7% | 95.2% | 98.8% | -0.03 (allowed ±0.23) | 1.06 (allowed 1.21) | +0.31% of 712 MB |
+| 16 KB | 193 | 66.3% | 93.8% | 99.5% | -0.06 (allowed ±0.22) | 1.07 (allowed 1.20) | +0.08% of 737 MB |
+| Normal distribution | | 68.3% | 95.4% | 99.7% | 0 | 1 | |
 
-Общая оценка кучи (`tgbotapi_heap_estimated_bytes` против точного объёма) на всех 200 съёмах — в
-пределах 2,7σ.
+The estimate of the whole heap was within 2.7σ and 3.6σ in all runs. Test bots use only 1-10 MB of memory, so their
+relative errors are big (median 7.6% with 64 KB and 3.8% with 16 KB), exactly as large as the server reports for such
+amounts; the error decreases as `1/sqrt(X)`. 3 of 360 observations are beyond 3σ, while about 1 is expected; they have
+11, 69 and 256 samples, and 2 of them are underestimates. Of the 131 observations with at least 100 samples one is
+beyond 3σ (-3.09σ). For the bot memory limit an underestimate is the safe side: it can only postpone a restart.
 
-Памяти у тестовых ботов немного (1–10 МБ), поэтому относительная ошибка большая: медиана 6,9% при
-шаге 64 КБ и 4,0% при 16 КБ, — ровно такая, какую сервер и заявил для такого объёма. С ростом памяти
-она падает как 1/√X (таблица выше). Проверяется не величина ошибки, а то, что заявленная σ ей
-соответствует.
+### A running server: `verify_memory_accuracy.py watch`
 
-За пределами 3σ оказались 3 наблюдения из 303 (по нормальному закону ожидалось бы около 1), и все
-три — недооценки у ботов, у которых отобрано мало блоков (40–101). Это свойство оценки по малой
-выборке: её распределение скошено, и когда в выборку не попали блоки среднего размера, занижены и
-оценка, и σ. Среди наблюдений со 120 и больше отобранными блоками за 3σ не вышло ни одно из 117.
-Для лимита памяти бота это безопасная сторона: недооценка может только отложить рестарт, но не
-вызвать лишний.
-
-### Свой сервер с реальными ботами: `verify_memory_accuracy.py watch`
-
-1. Запустите один сервер (канарейку) с `TELEGRAM_BOT_API_MEMORY_AUDIT=1`. Режим стоит 16 байт на каждое
-   живое выделение памяти (в тестах +6% к куче и +4% к RSS, больше при очень мелких выделениях) и
-   немного CPU, поэтому он нужен только на время проверки. Оценки в нём те же: выборка и веса от
-   режима не зависят.
-2. Запустите проверку на час:
+1. Run a server with `TELEGRAM_BOT_API_MEMORY_AUDIT=1`. The mode costs 16 bytes per live allocation and a little CPU,
+   so it is intended for a canary server. The estimates are the same as without the mode.
+2. Run the check, for example, for an hour:
 
    ```
-   python3 test/verify/verify_memory_accuracy.py watch http://<stat address>:<stat port>/metrics \
-       --duration=3600 --period=60 --csv=canary.csv
+   python3 test/verify/verify_memory_accuracy.py watch http://<stat address>:<stat port>/metrics --duration=3600 --period=60
    ```
 
-3. Скрипт на каждом съёме считает z = (оценка − точное) / σ для каждого бота, у которого отобрано не
-   меньше 30 блоков. Оценки разных ботов независимы, так что сервер с сотнями ботов даёт сотни
-   независимых наблюдений за один съём. Последовательные съёмы одного бота зависимы, поэтому допуски
-   считаются по наименьшему числу ботов в одном съёме. Итог — `ALL CHECKS PASSED` или список
-   проваленных проверок, плюс таблица фактических ошибок по размеру памяти ботов.
+The tool computes z for every bot with enough samples in every scrape and prints `ALL CHECKS PASSED` or the failed
+checks. Estimates of different bots are independent; consecutive scrapes of a bot are not, so the tolerances use the
+smallest number of bots in a scrape.
 
-Критерий приёмки: все проверки `PASS`. Если стандартное отклонение z заметно меньше 1 (`WARN`), σ
-завышена — это безопасно, но значит, что сервер сообщает погрешность больше настоящей.
+## No added latency
 
-## 3. Почему учёт не мешает серверу
+**The fast path** of almost every allocation decrements the byte counter of the thread, reads the chunk size from the
+header of the real allocator and adds it to the exact counter of the thread: no locks, system calls or allocations.
 
-**Обычный путь** — почти каждое выделение: уменьшить счётчик байтов потока до следующей метки,
-прочитать размер блока из заголовка настоящего аллокатора, прибавить его к счётчику потока. Ни
-блокировок, ни системных вызовов, ни выделений памяти. Пара `malloc` + `free` стоит 25 нс вместо
-20 нс у одного glibc; медленный путь добавляет в среднем ещё около 1 нс, а в стресс-тесте, где
-4 потока только и делают, что выделяют память, — около 10 нс из-за обмена общими данными между
-ядрами. На сервере, где выделение памяти — малая часть работы, это +1,6% CPU на запрос (ниже).
+**The slow path**, once per `T` bytes on average, places the sampled block in the reserved range and updates free
+lists, the context table and owner counters under a mutex: O(1) work without allocations and system calls, except
+`mmap` for blocks of 32 MB and more, as glibc does. Freed sampled runs up to 1 MB are cached (up to 8 MB); other runs
+are returned to the OS with `madvise` outside of the mutex. `calloc` zeroes memory outside of the mutex too. The
+duration of slow operations including waiting for the mutex is exported in
+`tgbotapi_memory_sampler_operation_seconds`.
 
-**Медленный путь** — отобранный блок, в среднем раз на T = 64 КБ выделенной памяти: блок берётся из
-своего диапазона адресов, и под общим мьютексом обновляются списки свободных блоков, таблица
-контекстов и счётчики владельца — работа O(1), без выделений памяти и без системных вызовов (кроме
-`mmap` для блоков от 32 МБ — glibc делает для них то же самое). Освобождённые отобранные блоки до 1 МБ
-кэшируются для повторного использования (до 8 МБ); остальные возвращаются ОС через `madvise` вне
-мьютекса. Обнуление для `calloc` — тоже вне мьютекса.
-
-**Сколько ждут другие потоки.** Мьютекс держится единицы микросекунд и занят малую долю времени:
-при 2 000 медленных операций в секунду по ~1 мкс — 0,2%, поэтому поток, которому он нужен, почти
-никогда не ждёт, а если ждёт, то не дольше одной операции. Если ОС или гипервизор снимет поток с
-процессора, пока он держит мьютекс, другие потоки ждут — как и с мьютексами самого glibc; это видно
-в `tgbotapi_memory_sampler_max_lock_wait_seconds`.
-
-**Что было найдено и исправлено этой проверкой.** Первая версия возвращала ОС память каждого
-освобождённого отобранного блока больше одной страницы через `madvise(MADV_DONTNEED)`. Это системный
-вызов с рассылкой сброса TLB по всем процессорам, и в виртуальной машине он занимал до 4,8 мс CPU на
-одну операцию, а glibc для таких блоков системных вызовов не делает. Диагностическая сборка,
-записывавшая для медленных операций CPU-время потока, время удержания мьютекса и переключения
-контекста, показала это, и теперь такие блоки кэшируются. После исправления за 15 секунд нагрузки —
-6 возвратов памяти ОС (только крупные блоки при запуске), а у оставшихся операций дольше 0,3 мс
-CPU-время потока не больше 100 мкс и мьютекс удерживается не больше 12 мкс, без переключений
-контекста: остальное время поток стоял, потому что гипервизор не давал виртуальному процессору
-работать (steal).
-
-## 4. Чем безвредность проверена
-
-### Сбои
-
-`heap-sampler-test stress` — 8 потоков, 2,4 млн операций всеми функциями выделения памяти (`malloc`,
-`calloc`, `realloc`, `reallocarray`, `memalign`, `posix_memalign`, `aligned_alloc`, `valloc`,
-`pvalloc`, `malloc_usable_size`, `free`) с шагом выборки 4 КБ: содержимое каждого блока проверяется
-по шаблону, `calloc` — на нули, выравнивание и `malloc_usable_size` — на соответствие. 0 ошибок на
-glibc и jemalloc, в обычном режиме и в режиме проверки. `edge` — граничные случаи: пустые блоки,
-переполнение размера, блоки на гигабайты, `fork`. Интеграционные сценарии `test/restart` проверяют,
-что ни один запрос не потерян, в том числе при перезапусках TDLib-инстансов по лимиту памяти бота.
-
-### Задержки и зависания: `latency_ab.py`
+**A/B test: `latency_ab.py`.** A server with memory accounting and a baseline server built with
+`-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF` run at the same time and get the same load: 2000 requests per second over 64
+connections (`getMe` and `getWebhookInfo` answered by Bot API, `getChatMember` and `getFile` answered by TDLib, and
+requests with 100 KB bodies) and probes sent by a fixed schedule: `getMe` every 2 ms and `getChatMember` every 5 ms.
+A probe latency is measured from its scheduled time, so a stall of a server delays all probes scheduled during the
+stall and can't be hidden. A pause of the whole machine delays both servers at the same time, so the paired
+comparison of rounds cancels it out; a probe stalled while probes of the other server weren't is an own stall of the
+server.
 
 ```
-python3 test/verify/latency_ab.py <build> \
-    --config=baseline=<сервер без учёта>/telegram-bot-api \
-    --config=memory=<build>/telegram-bot-api \
-    --concurrent=1 --rounds=40 --duration=10 --json=latency.json
-python3 test/verify/latency_ab.py --analyze=latency.json   # пересчитать отчёт по сохранённым данным
+python3 test/verify/latency_ab.py --build=<build dir> --config=baseline=<baseline build dir>/telegram-bot-api \
+    --config=accounting=<build dir>/telegram-bot-api --rounds=40 --duration=10 --json=latency.json
+python3 test/verify/latency_ab.py --analyze=latency.json   # report saved results again
 ```
 
-Сервер без учёта — тот же код, собранный с `-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF`. Каждый сервер
-получает одинаковую нагрузку: 2 000 запросов в секунду по расписанию через
-64 соединения (`getMe`, `getWebhookInfo` — отвечает Bot API; `getChatMember`, `getFile` — отвечает
-TDLib; запросы со 100 КБ тела — крупные блоки, которые отбираются чаще всего) и зонды по расписанию:
-`getMe` каждые 2 мс и `getChatMember` каждые 5 мс. Задержка зонда считается от времени по
-расписанию, поэтому зависание сервера задерживает все зонды, которые должны были уйти за это время,
-и не прячется. Сравнение идёт по парам из одного раунда: оценка Ходжеса — Лемана и 95%
-доверительный интервал по критерию знаковых рангов Уилкоксона, которые не портит один раунд,
-испорченный машиной. `PASS` — рост больше допустимого исключён, `FAIL` — доказан, `INCONCLUSIVE` —
-шум слишком велик, нужно больше раундов. Также сравниваются CPU сервера на запрос, пиковая RSS, доля
-зондов, задержанных больше чем на 10 мс, и внутренние метрики за время измерения: длительность
-операций учёта и задержки таймеров потоков.
+Every statistic is compared over paired rounds: the Hodges-Lehmann estimate of the difference and the 95% confidence
+interval of the Wilcoxon signed-rank test, which a single disturbed round can't spoil. `PASS` means that an increase
+bigger than the allowed one is rejected at the significance level of 2.5%.
 
-**Почему серверы запускаются одновременно.** Сначала серверы запускались по очереди (8 раундов по
-20 с, затем 30 раундов по 8 с). В виртуальной машине хвосты задержек определяли паузы самой машины:
-в отдельных прогонах одновременно опаздывали таймеры всех 12 потоков сервера, и зонды задерживались
-на десятки миллисекунд — у сервера без учёта в 4 прогонах из 30, у сервера с учётом в 7, причём
-медленных операций учёта в этих прогонах почти не было. Разница 4 и 7 из 30 статистически незначима,
-но и исключить по ней рост хвостов нельзя: p99 и p99,9 вышли `INCONCLUSIVE`. При одновременном
-запуске пауза машины задерживает зонды обоих серверов в одно и то же время, так что сравнение пар
-её вычитает, а зонды, задержанные, когда зонды другого сервера не задерживались, — это задержки по
-вине самого сервера.
+Results of 40 rounds of 10 seconds on a virtual machine with 4 cores, where the load generator shares the cores with
+both servers:
 
-Результаты одновременного запуска, 40 раундов по 10 с, у каждого сервера 2 000 запросов в секунду
-плюс зонды (виртуальная машина KVM, 4 ядра):
-
-| | Без учёта | С учётом | Разница, 95% ДИ | Допуск | |
+| Statistic | Baseline | Accounting | Difference, 95% CI | Allowed | |
 |---|---|---|---|---|---|
-| `getMe`, p50 | 0,928 мс | 0,931 мс | +0,002 [−0,003; +0,007] | +0,2 | PASS |
-| `getMe`, p99 | 2,173 мс | 2,166 мс | −0,039 [−0,100; +0,017] | +0,5 | PASS |
-| `getMe`, p99,9 | 5,79 мс | 5,43 мс | −0,35 [−1,43; +0,29] | +1,45 | PASS |
-| `getChatMember` (TDLib), p50 | 2,038 мс | 2,039 мс | +0,001 [−0,013; +0,012] | +0,2 | PASS |
-| `getChatMember`, p99 | 3,887 мс | 3,877 мс | −0,073 [−0,165; +0,010] | +0,58 | PASS |
-| `getChatMember`, p99,9 | 7,92 мс | 7,13 мс | −0,72 [−1,58; +0,03] | +1,98 | PASS |
-| Зонды, задержанные > 10 мс | 246 + 125 | 201 + 102 | | | |
-| из них по вине сервера | 23 + 23 | 22 + 21 | | | PASS |
-| CPU сервера на запрос | 125,2 мкс | 127,0 мкс | +2,0 [+1,7; +2,6] (+1,6%) | +6,3 | PASS |
-| Пиковая RSS | 41,8 МБ | 42,9 МБ | | | |
-| Ошибки | 0 из 1 080 080 | 0 из 1 080 080 | | | PASS |
+| Failed requests | 0 of 1080120 | 0 of 1080120 | | 0 | PASS |
+| `getMe` probes, p50 | 0.808 ms | 0.812 ms | +0.005 [-0.000, +0.010] ms | +0.2 ms | PASS |
+| `getMe` probes, p99 | 2.671 ms | 2.684 ms | +0.041 [-0.213, +0.281] ms | +0.5 ms | PASS |
+| `getMe` probes, p99.9 | 12.93 ms | 14.30 ms | -0.20 [-1.38, +1.07] ms | +3.23 ms | PASS |
+| `getChatMember` probes, p50 | 1.918 ms | 1.921 ms | -0.003 [-0.016, +0.012] ms | +0.2 ms | PASS |
+| `getChatMember` probes, p99 | 4.561 ms | 4.554 ms | -0.081 [-0.409, +0.160] ms | +0.68 ms | PASS |
+| `getChatMember` probes, p99.9 | 20.28 ms | 18.51 ms | -1.19 [-3.23, +0.56] ms | +5.07 ms | PASS |
+| `getMe` probes delayed by more than 10 ms by the server itself | 0.000% | 0.000% | +0.000 [-0.020, +0.000]% | +0.1% | PASS |
+| `getChatMember` probes delayed by more than 10 ms by the server itself | 0.050% | 0.000% | +0.000 [-0.025, +0.025]% | +0.1% | PASS |
+| CPU time per request | 106.3 µs | 107.2 µs | +0.93 [+0.56, +1.30] µs | +5.3 µs | PASS |
+| Peak RSS | 41.8 MB | 43.1 MB | | | |
 
-Внутренние метрики сервера с учётом за время измерений: 333 660 операций с отобранными блоками, из
-них дольше 0,1 мс — 45, дольше 1 мс — одна (1,5 мс), самое долгое ожидание мьютекса — 0,38 мс.
-Задержки таймеров потоков дольше 10 мс — 94 без учёта и 93 с учётом, почти половина из них — в
-потоке 2 (сборка мусора и удаление файлов TDLib) у обоих.
+The columns of the servers are medians over the rounds. During the measurements the server with accounting made
+356271 operations with sampled allocations: 29 of them took longer than 0.1 ms and 2 longer than 1 ms, and the
+longest wait for the lock was 0.87 ms. Timers of the threads were delayed by more than 10 ms 285 times in the baseline
+and 269 times with accounting, and by more than 100 ms 3 and 6 times; such delays happen at the same time in both
+servers and are caused by the virtual machine.
 
-### Свой сервер под реальной нагрузкой
+On a running server the same is visible all the time: `tgbotapi_memory_sampler_operation_seconds`,
+`tgbotapi_memory_sampler_max_lock_wait_seconds`, `tgbotapi_scheduler_lag_seconds` and
+`tgbotapi_bot_request_duration_seconds`.
 
-Постоянно, без режима проверки, видно:
+## Metrics
 
-- `tgbotapi_memory_sampler_operation_seconds` — сколько длятся операции учёта, которые берут мьютекс;
-  `tgbotapi_memory_sampler_max_lock_wait_seconds` — сколько потоки ждали его в худшем случае;
-- `tgbotapi_scheduler_lag_seconds{scheduler}` и `tgbotapi_scheduler_max_lag_seconds` — насколько
-  каждый поток сервера опаздывает с реакцией на таймер, по любой причине;
-- `tgbotapi_bot_request_duration_seconds` — время ответа каждого бота.
-
-Для A/B в продакшене запустите одновременно рядом сервер с `--memory-sampling-interval=0` (учёт
-выключен, остаётся только точный общий счётчик — тот же обычный путь без медленного) и сравните на
-одинаковой нагрузке перцентили времени ответа и `tgbotapi_scheduler_lag_seconds`:
-
-```
-histogram_quantile(0.99, sum by (instance, le) (rate(tgbotapi_bot_request_duration_seconds_bucket[5m])))
-histogram_quantile(0.999, sum by (instance, le) (rate(tgbotapi_scheduler_lag_seconds_bucket[5m])))
-tgbotapi_memory_sampler_max_lock_wait_seconds
-```
-
-Критерий приёмки: перцентили времени ответа и задержек таймеров не хуже, чем у сервера без учёта, в
-пределах шума между одинаковыми серверами; операции учёта дольше 1 мс — единичные на сотни тысяч
-(в A/B выше — одна из 333 660) и объясняются вытеснением потока (см. выше).
-
-## Ограничения
-
-- Погрешность статистическая: в 0,3% случаев ошибка больше 3σ. Для решений по лимитам используйте
-  оценку с запасом, например `оценка − 2σ` для подтверждения превышения.
-- При малом числе отобранных блоков (меньше ~100) сама σ оценена грубо, и ошибка чаще в сторону
-  недооценки.
-- Задержки зависят от машины. Измерения выше сделаны на виртуальной машине с 4 ядрами, где
-  нагрузочные скрипты на Python делят процессоры с сервером; на выделенной машине шум меньше, и
-  `latency_ab.py` позволяет повторить сравнение там.
+Every scenario of `restart_test.py` validates every metrics page it reads: each family has one `HELP` and one `TYPE`,
+counter names end with `_total`, there are no duplicate series and no bot tokens, counters aren't negative, histogram
+buckets are cumulative and end with `+Inf` equal to `_count`. The scenarios `metrics`, `metrics_disabled`, `resources`
+and `memory` check the values listed above. `test/test_docs.py` checks that [METRICS.md](METRICS.md) documents exactly
+the metrics declared by the server.

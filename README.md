@@ -13,8 +13,7 @@ Please note that only global Bot API issues that affect all bots are suitable fo
 - [Documentation](#documentation)
 - [Moving a bot to a local server](#switching)
 - [Moving a bot from one local server to another](#moving)
-- [Releasing memory of TDLib instances](#memory)
-- [Per-bot metrics](#metrics)
+- [Changes of this fork](#fork)
 - [License](#license)
 
 <a name="installation"></a>
@@ -95,55 +94,40 @@ If you want to avoid losing updates between logging out on the old server and la
 After the instance is closed, locate the bot's subdirectory in the working directory of the old server by the bot's user ID, move the subdirectory to the working directory of the new server
 and continue sending requests to the new server as usual.
 
-<a name="memory"></a>
-## Releasing memory of TDLib instances
+<a name="fork"></a>
+## Changes of this fork
 
-Each bot is served by a separate TDLib instance, which keeps all users, chats and files the bot has ever seen in memory,
-so memory usage of the server grows with time. The server can gracefully restart the TDLib instance of a bot without
-restarting the process: receiving of new updates is paused until the bot has no active requests, then new requests of
-the bot are delayed, all received updates are handled, the TDLib instance is closed and reopened from the same database,
-and the delayed requests are processed. No request fails, no update is lost or sent twice, and other bots aren't
-affected.
+* **Graceful restarts of TDLib instances.** Memory of the TDLib instance of a bot grows with every user, chat and file
+  the bot has seen. The server can close and reopen the instance of a bot on the fly, which releases its memory, without
+  failing requests, losing or duplicating updates or affecting other bots. See [RESTARTS.md](RESTARTS.md).
+* **Metrics.** `GET http://<stat address>:<stat port>/metrics` returns metrics of every bot and of the server in the
+  Prometheus text format: requests, updates, webhook deliveries, files, CPU time, memory, disk usage, objects in memory
+  of TDLib instances and restarts. See [METRICS.md](METRICS.md).
+* **CPU and memory accounting by bots.** CPU time of each bot is estimated by sampling with `SIGPROF`; memory of each
+  bot is estimated by sampling of memory allocations with a reported standard deviation. See [METRICS.md](METRICS.md).
+* **Verification.** [VERIFICATION.md](VERIFICATION.md) lists the claims about the changes, how they are proven and
+  tested, and how to repeat the checks; `test/run_all.sh <build dir>` runs all tests.
 
-* `--tdlib-restart-memory-limit=<megabytes>` - restart TDLib instances of the most active bots one by one while memory
-  usage of the server exceeds the limit; see also `--tdlib-restart-min-uptime`.
-* `--tdlib-restart-interval=<seconds>` - restart TDLib instance of each bot after the specified uptime.
-* `--tdlib-restart-drain-timeout=<seconds>` - maximum time to wait for active requests of a bot; the restart is postponed
-  if the time is exceeded.
-* `--malloc-trim` - return free memory to the OS after restarts; useful only with glibc memory allocator.
-* `--message-unload-delay=<seconds>` - delay after which unused messages are unloaded from TDLib memory.
-* `GET http://<stat address>:<stat port>/?restart=<bot_id>|all` - request a restart manually.
+| Option | Default | Meaning |
+|---|---|---|
+| `--tdlib-restart-memory-limit=<MB>` | disabled | Restart the instance using the most memory while resident memory of the server exceeds the limit |
+| `--tdlib-restart-bot-memory-limit=<MB>` | disabled | Restart the instance of a bot, which uses more memory than the limit |
+| `--tdlib-restart-min-uptime=<seconds>` | 3600 | Minimum uptime of an instance before a restart because of a memory limit |
+| `--tdlib-restart-interval=<seconds>` | disabled | Restart each instance after the uptime |
+| `--tdlib-restart-drain-timeout=<seconds>` | 30 | Maximum time to wait for active requests of a bot before a restart is cancelled |
+| `--tdlib-restart-cooldown=<seconds>` | 10 | Minimum delay between starts of restarts |
+| `--malloc-trim` | disabled | Return free memory to the OS after restarts; only for glibc |
+| `--message-unload-delay=<seconds>` | TDLib default | Delay after which unused messages are unloaded from memory of TDLib instances |
+| `--cpu-sampling-rate=<samples>` | 100 | Samples per second of CPU time of a thread; 0 disables CPU accounting |
+| `--memory-sampling-interval=<KB>` | 64 | Mean size of allocated memory between samples; 0 disables memory accounting |
 
-See [MEMORY.md](MEMORY.md) for details (in Russian).
+`GET http://<stat address>:<stat port>/?restart=<bot_id>|all` requests a restart manually. The statistics port must be
+accessible only from the internal network.
 
-<a name="metrics"></a>
-## Per-bot metrics
-
-`GET http://<stat address>:<stat port>/metrics` returns metrics in the Prometheus text format for VictoriaMetrics or
-Prometheus: requests by method, HTTP status code and failure reason, answer time, request and answer sizes, requests
-abandoned by clients, files sent by upload, local path, file_id or URL, file downloads by result, updates by type,
-webhook deliveries, disk usage, Bot API cache sizes, numbers of objects in memory of TDLib instances, estimated memory
-usage and CPU time, and graceful restarts of TDLib instances of each bot.
-`?bot=<bot_id>` limits the output to a single bot. See [METRICS.md](METRICS.md) for details (in Russian).
-
-CPU time of each bot is estimated by sampling: each thread is interrupted with `SIGPROF` after every 10 milliseconds of
-its CPU time and the current actor context is remembered. Use `--cpu-sampling-rate` to change the number of samples
-per second of CPU time or `--cpu-sampling-rate=0` to disable the sampling. The sampling is supported only on Linux.
-Disable the sampling to use other profilers based on `SIGPROF`, for example, gperftools or gprof.
-
-Memory used by each bot is estimated by sampling of memory allocations: memory allocation functions are replaced with
-wrappers, which forward calls to glibc or to an allocator loaded with `LD_PRELOAD`, count total size of live allocations
-exactly and remember a random subset of allocations together with the bot, which made them. Use
-`--memory-sampling-interval` to change the mean number of kilobytes between samples or `--memory-sampling-interval=0`
-to disable the sampling. Build with `-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF` to keep the original allocation functions.
-The accounting is supported only on Linux with dynamically linked glibc. `--tdlib-restart-bot-memory-limit` restarts
-TDLib instances of bots, which use more memory than specified. The standard deviation of the estimate of each bot is
-exported too. With the environment variable `TELEGRAM_BOT_API_MEMORY_AUDIT=1` memory of each bot is also counted exactly
-at the cost of 16 bytes per allocation; [VERIFICATION.md](VERIFICATION.md) (in Russian) explains how the accuracy of the
-estimates and the absence of added latency are proven and how to check them with `test/verify/`.
-
-Numbers of objects in memory require a small patch of TDLib from [td-patches](td-patches/README.md), which is applied
-automatically by CMake, so `git` is needed to build the server.
+Memory accounting replaces memory allocation functions and works only on Linux with dynamically linked glibc; build with
+`-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF` to keep the original functions. CPU accounting works only on Linux. Numbers of
+objects in memory of TDLib instances require a small patch of TDLib from [td-patches](td-patches/README.md), which is
+applied by CMake automatically, so `git` is needed for the build.
 
 <a name="license"></a>
 ## License
