@@ -137,7 +137,10 @@ exactly and remember a random subset of allocations together with the bot, which
 `--memory-sampling-interval` to change the mean number of kilobytes between samples or `--memory-sampling-interval=0`
 to disable the sampling. Build with `-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF` to keep the original allocation functions.
 The accounting is supported only on Linux with dynamically linked glibc. `--tdlib-restart-bot-memory-limit` restarts
-TDLib instances of bots, which use more memory than specified.
+TDLib instances of bots, which use more memory than specified. The standard deviation of the estimate of each bot is
+exported too. With the environment variable `TELEGRAM_BOT_API_MEMORY_AUDIT=1` memory of each bot is also counted exactly
+at the cost of 16 bytes per allocation; [VERIFICATION.md](VERIFICATION.md) (in Russian) explains how the accuracy of the
+estimates and the absence of added latency are proven and how to check them with `test/verify/`.
 
 Numbers of objects in memory require a small patch of TDLib from [td-patches](td-patches/README.md), which is applied
 automatically by CMake, so `git` is needed to build the server.
