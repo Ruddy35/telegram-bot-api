@@ -589,16 +589,13 @@ int main(int argc, char *argv[]) {
   //              << (td::GitInfo::is_dirty() ? "(dirty)" : "") << " started";
   LOG(WARNING) << "Bot API " << parameters->version_ << " server started";
 
-  // must be enabled before creation of scheduler threads, so they sample allocations from the start
-  if (parameters->memory_sampling_interval_ > 0) {
-    if (HeapSampler::is_supported()) {
-      HeapSampler::set_sampling_interval(parameters->memory_sampling_interval_);
-    } else {
-      LOG(WARNING) << "Memory accounting isn't supported by the build";
-    }
-  }
+  // must be changed before creation of scheduler threads, so they use the interval from the start
+  HeapSampler::set_sampling_interval(parameters->memory_sampling_interval_);
   if (HeapSampler::get_sampling_interval() <= 0) {
     parameters->memory_sampling_interval_ = 0;
+    if (parameters->tdlib_restart_bot_memory_limit_ > 0) {
+      LOG(ERROR) << "TDLib restart bot memory limit is ignored, because memory accounting is disabled or unsupported";
+    }
   }
 
   td::ConcurrentScheduler sched(SharedData::get_thread_count() - 1, cpu_affinity);

@@ -50,6 +50,8 @@ constexpr td::int32 RUN_CLASS_COUNT = 40;
 constexpr td::uint32 NO_PAGE = 0xFFFFFFFFu;
 constexpr td::int64 DISABLED_RECHECK_BYTES = 1 << 20;
 constexpr td::int64 DEFAULT_SAMPLING_INTERVAL = static_cast<td::int64>(64) << 10;
+// sampled blocks of at least this size are mapped with commit accounting; glibc uses mmap for blocks of this size too
+constexpr std::size_t COMMIT_THRESHOLD = static_cast<std::size_t>(32) << 20;
 constexpr td::int32 MAX_OWNERS = 1 << 16;
 constexpr std::size_t CONTEXT_TABLE_SIZE = 1 << 16;
 constexpr td::uint64 DELETED_CONTEXT = 1;
@@ -71,6 +73,7 @@ struct RealAllocator {
 std::atomic<td::int64> sampling_interval{0};
 std::atomic<std::uintptr_t> region_begin{~static_cast<std::uintptr_t>(0) - REGION_SIZE + 1};  // unreachable range
 std::atomic<bool> is_region_reserved{false};
+pthread_mutex_t sampler_mutex = PTHREAD_MUTEX_INITIALIZER;  // protects owners, contexts and sampled blocks
 
 RealAllocator real;
 std::atomic<int> init_state{0};  // 0 - not initialized, 1 - initializing, 2 - initialized
@@ -103,9 +106,10 @@ std::size_t read_glibc_chunk_header(const void *ptr) {
   return static_cast<const std::size_t *>(ptr)[-1];
 }
 
-// checks that the chunk header has the expected format, so the chunk size can be read without a function call
+// checks that the chunk header has the expected format, so the chunk size can be read without a function call;
+// freeing of mmapped chunks smaller than 32 MB would increase the dynamic mmap threshold of glibc, so they aren't used
 bool check_glibc_chunk_header(const RealAllocator &r) {
-  static const std::size_t sizes[] = {0, 1, 24, 25, 100, 1000, 5000, 100000, 1000000, 10000000};
+  static const std::size_t sizes[] = {0, 1, 24, 25, 100, 1000, 5000, 100000, static_cast<std::size_t>(40) << 20};
   bool is_ok = true;
   for (auto size : sizes) {
     void *ptr = r.malloc_(size);
@@ -160,6 +164,9 @@ bool ensure_initialized() {
       sampling_interval.store(DEFAULT_SAMPLING_INTERVAL, std::memory_order_relaxed);
     }
     init_state.store(2, std::memory_order_release);
+    // a child process must not inherit the mutex locked by another thread
+    pthread_atfork([] { pthread_mutex_lock(&sampler_mutex); }, [] { pthread_mutex_unlock(&sampler_mutex); },
+                   [] { pthread_mutex_unlock(&sampler_mutex); });
   } else {
     while (init_state.load(std::memory_order_acquire) != 2) {
       sched_yield();
@@ -290,18 +297,20 @@ inline bool is_sampled_block(const void *ptr) {
 }
 
 struct SampleInfo {
-  td::uint64 size;   // requested size
-  td::int64 chunk;   // size of memory, which would be used by the real allocator
-  td::int64 weight;  // estimated size of all allocations represented by the sample
-  td::int32 owner;   // 0 if the allocation wasn't made by an owner
-  td::uint16 generation;
+  td::uint64 size;        // requested size
+  td::int64 chunk;        // size of memory, which would be used by the real allocator
+  td::int64 weight;       // estimated size of all allocations represented by the sample
+  td::uint32 generation;  // generation of the owner
+  td::uint16 owner;       // 0 if the allocation wasn't made by an owner
   td::uint8 part;
   td::uint8 small_class;  // class of a small slot or 0 for page runs
 };
 static_assert(sizeof(SampleInfo) <= SMALL_HEADER_SIZE, "");
+static_assert(MAX_OWNERS <= 65536, "");
 
 struct RunInfo {
   SampleInfo sample;
+  td::uint64 committed_bytes;  // size of the mapping with commit accounting at the beginning of the run
   td::uint32 run_class;
   td::uint32 next_free;
 };
@@ -310,7 +319,7 @@ RunInfo *run_infos = nullptr;  // for each page of the region
 struct OwnerInfo {
   std::atomic<td::int64> bytes[HeapSampler::PART_COUNT];
   std::atomic<td::int64> sample_count;
-  td::uint16 generation;
+  td::uint32 generation;
   bool is_used;
 };
 OwnerInfo owners[MAX_OWNERS];  // owners[0] accumulates unattributed allocations
@@ -329,7 +338,6 @@ std::size_t context_count = 0;
 std::size_t deleted_context_count = 0;
 
 // state of the sampled blocks allocator, protected by sampler_mutex
-pthread_mutex_t sampler_mutex = PTHREAD_MUTEX_INITIALIZER;
 td::uint32 next_region_page = 0;
 td::uint32 free_runs[RUN_CLASS_COUNT];
 void *free_small_slots[SMALL_CLASS_COUNT];
@@ -420,14 +428,17 @@ void rehash_contexts() {
 }
 
 // must be called under the lock
-char *allocate_run(td::uint32 run_class) {
+char *allocate_run(td::uint32 run_class, bool &is_zero) {
   td::uint32 page = free_runs[run_class];
   if (page != NO_PAGE) {
     free_runs[run_class] = run_infos[page].next_free;
+    // pages of bigger runs are returned to the OS when the runs are freed
+    is_zero = run_class > 0;
     if (run_class == 0) {
       cached_run_pages--;
     }
   } else {
+    is_zero = true;
     td::uint64 page_count = static_cast<td::uint64>(1) << run_class;
     if (next_region_page + page_count > REGION_PAGE_COUNT) {
       return nullptr;
@@ -436,7 +447,62 @@ char *allocate_run(td::uint32 run_class) {
     next_region_page += static_cast<td::uint32>(page_count);
   }
   run_infos[page].run_class = run_class;
+  run_infos[page].committed_bytes = 0;
   return reinterpret_cast<char *>(region_begin.load(std::memory_order_relaxed) + page * HEAP_PAGE_SIZE);
+}
+
+// must be called under the lock
+void release_run(td::uint32 page) {
+  auto run_class = run_infos[page].run_class;
+  run_infos[page].next_free = free_runs[run_class];
+  free_runs[run_class] = page;
+  if (run_class == 0) {
+    cached_run_pages++;
+  }
+}
+
+// big blocks are mapped with commit accounting, so they can't be allocated if there is not enough memory
+bool commit_pages(char *begin, std::size_t size) {
+  return mmap(begin, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED;
+}
+
+// returns memory to the OS
+void decommit_pages(char *begin, std::size_t size, bool is_committed) {
+  if (!is_committed || mmap(begin, size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE, -1, 0) == MAP_FAILED) {
+    madvise(begin, size, MADV_DONTNEED);
+  }
+}
+
+std::size_t round_to_pages(std::size_t size) {
+  return (size + HEAP_PAGE_SIZE - 1) & ~(HEAP_PAGE_SIZE - 1);
+}
+
+// must be called under the lock
+void add_owner_sample(SampleInfo &info, td::uint64 context, td::int32 sign) {
+  if (sign > 0) {
+    td::int32 owner = 0;
+    td::int32 part = 0;
+    auto *context_entry = find_context(context);
+    if (context_entry != nullptr) {
+      owner = context_entry->owner;
+      part = part_override >= 0 ? part_override : context_entry->part;
+    }
+    info.owner = static_cast<td::uint16>(owner);
+    info.generation = owners[owner].generation;
+    info.part = static_cast<td::uint8>(part);
+  }
+  td::int32 owner = info.owner;
+  if (owner != 0 && owners[owner].generation != info.generation) {
+    owner = 0;  // the owner was destroyed and its memory was moved to the unattributed memory
+  }
+  auto &owner_info = owners[owner];
+  owner_info.bytes[info.part].store(owner_info.bytes[info.part].load(std::memory_order_relaxed) + sign * info.weight,
+                                    std::memory_order_relaxed);
+  owner_info.sample_count.store(owner_info.sample_count.load(std::memory_order_relaxed) + sign,
+                                std::memory_order_relaxed);
+  total_sample_count += sign;
+  total_sampled_bytes += sign * info.chunk;
 }
 
 td::uint32 get_page(const void *ptr) {
@@ -460,33 +526,32 @@ SampleInfo *get_sample_info(void *ptr) {
   return reinterpret_cast<SampleInfo *>(static_cast<char *>(ptr) - SMALL_HEADER_SIZE);
 }
 
+td::int64 get_sample_weight(std::size_t size, td::int64 chunk, td::int64 interval) {
+  double probability = -std::expm1(-static_cast<double>(size + 1) / static_cast<double>(interval));
+  return static_cast<td::int64>(std::llround(static_cast<double>(chunk) / probability));
+}
+
 // returns nullptr if the block can't be allocated
 void *sample_allocate(std::size_t size, std::size_t alignment, bool zero) {
-  if (alignment > HEAP_PAGE_SIZE) {
+  if (alignment > HEAP_PAGE_SIZE || sample_interval <= 0) {
     return nullptr;
   }
   auto chunk = get_chunk_size(size);
-  double probability = -std::expm1(-static_cast<double>(size + 1) / static_cast<double>(sample_interval));
-  if (!(probability > 0.0)) {
-    return nullptr;
-  }
-  auto weight = static_cast<td::int64>(std::llround(static_cast<double>(chunk) / probability));
+  auto weight = get_sample_weight(size, chunk, sample_interval);
   auto context = reinterpret_cast<td::uint64>(td::Scheduler::context());
   bool is_small = alignment <= 16 && size + SMALL_HEADER_SIZE <= MAX_SMALL_SLOT_SIZE;
 
-  void *result = nullptr;
   SamplerLock lock;
-  td::int32 owner = 0;
-  td::int32 part = 0;
-  auto *context_entry = find_context(context);
-  if (context_entry != nullptr) {
-    owner = context_entry->owner;
-    part = part_override >= 0 ? part_override : context_entry->part;
-  }
-
   SampleInfo *info;
+  char *result;
+  bool is_zero = false;
   if (is_small) {
+    // slots have at least 16 bytes of data, so the last slot of a page doesn't end at the page boundary and
+    // pointers to small blocks are never page-aligned
     auto slot_size = (size + SMALL_HEADER_SIZE + 15) & ~static_cast<std::size_t>(15);
+    if (slot_size < SMALL_HEADER_SIZE + 16) {
+      slot_size = SMALL_HEADER_SIZE + 16;
+    }
     auto small_class = slot_size / 16;
     char *slot = static_cast<char *>(free_small_slots[small_class]);
     if (slot != nullptr) {
@@ -494,7 +559,8 @@ void *sample_allocate(std::size_t size, std::size_t alignment, bool zero) {
     } else {
       if (small_slab_pos[small_class] == nullptr ||
           small_slab_pos[small_class] + slot_size > small_slab_end[small_class]) {
-        char *page = allocate_run(0);
+        bool is_page_zero;
+        char *page = allocate_run(0, is_page_zero);
         if (page == nullptr) {
           return nullptr;
         }
@@ -509,71 +575,98 @@ void *sample_allocate(std::size_t size, std::size_t alignment, bool zero) {
     info->small_class = static_cast<td::uint8>(small_class);
     result = slot + SMALL_HEADER_SIZE;
   } else {
-    char *run = allocate_run(get_run_class(size));
+    char *run = allocate_run(get_run_class(size), is_zero);
     if (run == nullptr) {
       return nullptr;
     }
-    info = &run_infos[get_page(run)].sample;
+    auto page = get_page(run);
+    auto mapped_size = round_to_pages(size);
+    if (mapped_size >= COMMIT_THRESHOLD) {
+      if (!commit_pages(run, mapped_size)) {
+        release_run(page);
+        return nullptr;
+      }
+      run_infos[page].committed_bytes = mapped_size;
+      is_zero = true;
+    }
+    info = &run_infos[page].sample;
     info->small_class = 0;
-    large_run_bytes += static_cast<td::int64>((size + HEAP_PAGE_SIZE - 1) & ~(HEAP_PAGE_SIZE - 1));
+    large_run_bytes += static_cast<td::int64>(mapped_size);
     result = run;
   }
   info->size = size;
   info->chunk = chunk;
   info->weight = weight;
-  info->owner = owner;
-  info->generation = owners[owner].generation;
-  info->part = static_cast<td::uint8>(part);
+  add_owner_sample(*info, context, 1);
 
-  auto &owner_info = owners[owner];
-  owner_info.bytes[part].store(owner_info.bytes[part].load(std::memory_order_relaxed) + weight,
-                               std::memory_order_relaxed);
-  owner_info.sample_count.store(owner_info.sample_count.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-  total_sample_count++;
-  total_sampled_bytes += chunk;
-
-  if (zero) {
+  if (zero && !is_zero) {
     std::memset(result, 0, size);
   }
   return result;
 }
 
+// changes size of a sampled page run without moving it; returns false if it isn't possible
+bool sample_reallocate_in_place(void *ptr, std::size_t size) {
+  if ((reinterpret_cast<std::uintptr_t>(ptr) & (HEAP_PAGE_SIZE - 1)) != 0) {
+    return false;  // a small slot
+  }
+  // a block of the new size would be sampled with the probability of at least 1 - exp(-16), so keeping the block
+  // sampled doesn't introduce a noticeable bias
+  auto interval = sampling_interval.load(std::memory_order_relaxed);
+  if (interval <= 0 || size / 16 < static_cast<std::size_t>(interval)) {
+    return false;
+  }
+  auto &run_info = run_infos[get_page(ptr)];
+  auto mapped_size = round_to_pages(size);
+  if (mapped_size > (HEAP_PAGE_SIZE << run_info.run_class)) {
+    return false;
+  }
+  if (run_info.committed_bytes == 0 ? mapped_size >= COMMIT_THRESHOLD : mapped_size > run_info.committed_bytes) {
+    if (run_info.committed_bytes == 0 ||
+        !commit_pages(static_cast<char *>(ptr) + run_info.committed_bytes, mapped_size - run_info.committed_bytes)) {
+      return false;
+    }
+    run_info.committed_bytes = mapped_size;
+  }
+
+  auto chunk = get_chunk_size(size);
+  auto weight = get_sample_weight(size, chunk, interval);
+  auto context = reinterpret_cast<td::uint64>(td::Scheduler::context());
+  SamplerLock lock;
+  auto &info = run_info.sample;
+  add_owner_sample(info, 0, -1);
+  large_run_bytes += static_cast<td::int64>(mapped_size) - static_cast<td::int64>(round_to_pages(info.size));
+  info.size = size;
+  info.chunk = chunk;
+  info.weight = weight;
+  add_owner_sample(info, context, 1);
+  return true;
+}
+
 void sample_free(void *ptr) {
   auto *info = get_sample_info(ptr);
-  td::uint32 run_class = 0;
   if (info->small_class == 0) {
     // return memory to the OS before the run can be reused by another thread
-    run_class = run_infos[get_page(ptr)].run_class;
-    if (run_class > 0) {
-      madvise(ptr, HEAP_PAGE_SIZE << run_class, MADV_DONTNEED);
+    auto &run_info = run_infos[get_page(ptr)];
+    if (run_info.committed_bytes > 0) {
+      // the block is never bigger than the committed mapping, so pages after it weren't used
+      decommit_pages(static_cast<char *>(ptr), run_info.committed_bytes, true);
+      run_info.committed_bytes = 0;
+    } else if (run_info.run_class > 0) {
+      decommit_pages(static_cast<char *>(ptr), HEAP_PAGE_SIZE << run_info.run_class, false);
     }
   }
 
   SamplerLock lock;
-  auto owner = info->owner;
-  if (owner != 0 && owners[owner].generation != info->generation) {
-    owner = 0;  // the owner was destroyed and its memory was moved to the unattributed memory
-  }
-  auto &owner_info = owners[owner];
-  owner_info.bytes[info->part].store(owner_info.bytes[info->part].load(std::memory_order_relaxed) - info->weight,
-                                     std::memory_order_relaxed);
-  owner_info.sample_count.store(owner_info.sample_count.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
-  total_sample_count--;
-  total_sampled_bytes -= info->chunk;
-
+  add_owner_sample(*info, 0, -1);
   if (info->small_class != 0) {
     auto small_class = info->small_class;
     char *slot = reinterpret_cast<char *>(info);
     *reinterpret_cast<void **>(slot) = free_small_slots[small_class];
     free_small_slots[small_class] = slot;
   } else {
-    large_run_bytes -= static_cast<td::int64>((info->size + HEAP_PAGE_SIZE - 1) & ~(HEAP_PAGE_SIZE - 1));
-    auto page = get_page(ptr);
-    run_infos[page].next_free = free_runs[run_class];
-    free_runs[run_class] = page;
-    if (run_class == 0) {
-      cached_run_pages++;
-    }
+    large_run_bytes -= static_cast<td::int64>(round_to_pages(info->size));
+    release_run(get_page(ptr));
   }
 }
 
@@ -599,6 +692,11 @@ bool reserve_region() {
     write_error("Failed to reserve address space for memory accounting\n");
     return false;
   }
+  // sparse ranges must not be collapsed into huge pages and dumped into core files
+  madvise(region, REGION_SIZE, MADV_NOHUGEPAGE);
+  madvise(region, REGION_SIZE, MADV_DONTDUMP);
+  madvise(infos, infos_size, MADV_NOHUGEPAGE);
+  madvise(infos, infos_size, MADV_DONTDUMP);
   run_infos = static_cast<RunInfo *>(infos);
   for (auto &free_run : free_runs) {
     free_run = NO_PAGE;
@@ -904,6 +1002,9 @@ void *realloc(void *ptr, std::size_t size) noexcept {
     do_free(ptr);
     return nullptr;
   }
+  if (is_sampled_block(ptr) && sample_reallocate_in_place(ptr, size)) {
+    return ptr;
+  }
   if (is_sampled_block(ptr) || is_bootstrap(ptr)) {
     auto old_size = do_usable_size(ptr);
     void *result = do_malloc(size);
@@ -970,6 +1071,10 @@ void *valloc(std::size_t size) noexcept {
 
 void *pvalloc(std::size_t size) noexcept {
   auto page_size = telegram_bot_api::HEAP_PAGE_SIZE;
+  if (size > ~static_cast<std::size_t>(0) - page_size) {
+    errno = ENOMEM;
+    return nullptr;
+  }
   size = size == 0 ? page_size : (size + page_size - 1) & ~(page_size - 1);
   return telegram_bot_api::do_memalign(page_size, size);
 }

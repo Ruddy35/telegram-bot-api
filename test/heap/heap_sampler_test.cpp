@@ -5,13 +5,14 @@
 // Verification of HeapSampler: correctness of all allocation functions under concurrent use, unbiasedness and
 // variance of estimates for different size distributions, attribution to owners, absence of drift, overhead.
 //
-// Usage: heap-sampler-test [stress] [exact] [attribution] [drift] [bias] [accuracy] [overhead]
+// Usage: heap-sampler-test [stress] [exact] [attribution] [edge] [drift] [bias] [accuracy] [overhead]
 //
 #include "telegram-bot-api/HeapSampler.h"
 
 #include "td/actor/actor.h"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -25,6 +26,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -680,6 +682,128 @@ void test_drift() {
   HeapSampler::set_sampling_interval(0);
 }
 
+// 4b. edge cases found by review
+void test_edge() {
+  std::printf("== edge cases\n");
+  HeapSampler::set_sampling_interval(1);  // sample every allocation
+
+  // sampled empty blocks fill whole slab pages; pointers to them must never be taken for page runs
+  std::vector<void *> empty_blocks;
+  std::vector<std::pair<void *, std::size_t>> big_blocks;
+  empty_blocks.reserve(1000);
+  big_blocks.reserve(100);
+  auto before = HeapSampler::get_stats();
+  for (int i = 0; i < 1000; i++) {
+    empty_blocks.push_back(escape(i % 2 ? malloc(0) : calloc(0, 10)));
+    if (i % 10 == 0) {
+      std::size_t size = 5000 + i;
+      void *p = malloc(size);
+      fill(p, size);
+      big_blocks.emplace_back(p, size);
+    }
+  }
+  int page_aligned = 0;
+  for (auto p : empty_blocks) {
+    // usable size of sampled empty blocks is 0; the real allocator can return page-aligned pointers
+    page_aligned += (reinterpret_cast<std::uintptr_t>(p) & 4095) == 0 && malloc_usable_size(p) == 0;
+    // 0 for sampled blocks, 24 for glibc; a wrong lookup would return the size of another block
+    CHECK_TEST(malloc_usable_size(p) <= 24, "usable size of an empty block");
+  }
+  CHECK_TEST(page_aligned == 0, "%d empty blocks are page-aligned", page_aligned);
+  for (auto p : empty_blocks) {
+    free(p);
+  }
+  int corrupted = 0;
+  for (auto &b : big_blocks) {
+    corrupted += !verify(b.first, b.second, b.first);
+    free(b.first);
+  }
+  CHECK_TEST(corrupted == 0, "%d blocks are corrupted", corrupted);
+  CHECK_TEST(HeapSampler::get_stats().sample_count == before.sample_count, "samples are freed");
+
+  // huge allocations fail like with glibc; jemalloc relies on overcommit and succeeds
+  void *huge = escape(malloc(static_cast<std::size_t>(1) << 46));
+  CHECK_TEST(huge == nullptr || real_mallctl != nullptr, "64 TB allocation succeeded");
+  free(huge);
+  errno = 0;
+  CHECK_TEST(pvalloc(~static_cast<std::size_t>(0) - 100) == nullptr && errno == ENOMEM, "pvalloc overflow");
+
+  // big sampled blocks are committed lazily, zeroed and resized in place
+  std::size_t big_size = static_cast<std::size_t>(40) << 20;
+  auto *big = static_cast<unsigned char *>(escape(calloc(1, big_size)));
+  CHECK_TEST(big != nullptr && big[0] == 0 && big[big_size - 1] == 0 && big[big_size / 2] == 0, "big calloc");
+  big[0] = 1;
+  big[big_size - 1] = 2;
+  auto *bigger = static_cast<unsigned char *>(escape(realloc(big, static_cast<std::size_t>(60) << 20)));
+  CHECK_TEST(bigger == big, "realloc in place");
+  CHECK_TEST(bigger[0] == 1 && bigger[big_size - 1] == 2, "realloc keeps data");
+  auto *smaller = static_cast<unsigned char *>(escape(realloc(bigger, static_cast<std::size_t>(30) << 20)));
+  CHECK_TEST(smaller == big && smaller[0] == 1, "shrink in place");
+  free(smaller);
+  CHECK_TEST(HeapSampler::get_stats().sample_count == before.sample_count, "big samples are freed");
+
+  // disabled sampling doesn't sample new allocations
+  HeapSampler::set_sampling_interval(0);
+  auto disabled_before = HeapSampler::get_stats().sample_count;
+  std::vector<void *> blocks;
+  blocks.reserve(10000);
+  for (int i = 0; i < 10000; i++) {
+    blocks.push_back(escape(malloc(1000)));
+  }
+  CHECK_TEST(HeapSampler::get_stats().sample_count == disabled_before, "sampling is disabled");
+  for (auto p : blocks) {
+    free(p);
+  }
+
+  // generation of a reused owner slot doesn't wrap, so old samples aren't removed from a new owner
+  HeapSampler::set_sampling_interval(1);
+  auto owner = HeapSampler::create_owner();
+  HeapSampler::set_context_owner(0x9000, owner, 0);
+  set_context(0x9000);
+  void *old_block = escape(malloc(100));
+  set_context(0);
+  HeapSampler::remove_context(0x9000, owner);
+  HeapSampler::destroy_owner(owner);
+  td::int32 new_owner = 0;
+  for (int i = 0; i < 100000; i++) {
+    new_owner = HeapSampler::create_owner();
+    if (i + 1 < 100000) {
+      HeapSampler::destroy_owner(new_owner);
+    }
+  }
+  CHECK_TEST(new_owner == owner, "owner slot is reused");
+  free(old_block);
+  auto stats = HeapSampler::get_owner_stats(new_owner);
+  CHECK_TEST(stats.bytes[0] == 0 && stats.sample_count == 0, "old sample affected a new owner after %d reuses", 100000);
+  HeapSampler::destroy_owner(new_owner);
+
+  // fork while another thread samples allocations
+  std::atomic<bool> stop{false};
+  std::thread allocator([&] {
+    while (!stop.load(std::memory_order_relaxed)) {
+      free(escape(malloc(100)));
+    }
+  });
+  int forks_ok = 0;
+  for (int i = 0; i < 50; i++) {
+    auto pid = fork();
+    if (pid == 0) {
+      for (int k = 0; k < 1000; k++) {
+        free(escape(malloc(static_cast<std::size_t>(k))));
+      }
+      _exit(0);
+    }
+    int status = 0;
+    if (pid > 0 && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+      forks_ok++;
+    }
+  }
+  stop = true;
+  allocator.join();
+  CHECK_TEST(forks_ok == 50, "%d of 50 forked children finished", forks_ok);
+  HeapSampler::set_sampling_interval(0);
+}
+
 // 5. the exact counter matches glibc accounting while many blocks are alive
 void test_exact() {
   std::printf("== exact counter with 1 million live blocks\n");
@@ -771,7 +895,7 @@ int main(int argc, char *argv[]) {
     tests.push_back(argv[i]);
   }
   if (tests.empty()) {
-    tests = {"stress", "exact", "attribution", "drift", "bias", "accuracy", "overhead"};
+    tests = {"stress", "exact", "attribution", "edge", "drift", "bias", "accuracy", "overhead"};
   }
   for (auto &test : tests) {
     if (test == "stress") {
@@ -786,6 +910,8 @@ int main(int argc, char *argv[]) {
       test_drift();
     } else if (test == "exact") {
       test_exact();
+    } else if (test == "edge") {
+      test_edge();
     } else if (test == "overhead") {
       test_overhead();
     }
