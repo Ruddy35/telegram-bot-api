@@ -401,6 +401,9 @@ def check_cpu_metrics(values):
     # samples are taken each 10 ms of CPU time of a thread and collected each second
     assert abs(client + tdlib + unattributed - threads) <= 0.2 * threads + 0.3, (client, tdlib, unattributed, threads)
     assert threads <= process + 0.1, (threads, process)
+    # each thread checks its timer delay 20 times per second
+    lag_counts = [value for (name, labels), value in values.items() if name == 'tgbotapi_scheduler_lag_seconds_count']
+    assert len(lag_counts) == 12 and min(lag_counts) > 0, lag_counts
     return client + tdlib
 
 
@@ -469,9 +472,12 @@ def check_memory_metrics(values):
     log('memory: heap %.1f MB, estimated %.1f MB (%d samples), unattributed %.1f MB, bots %s' % (
         exact / 1e6, estimated / 1e6, samples, unattributed / 1e6,
         {bot_id: {part: round(value / 1e6, 2) for part, value in parts.items()} for bot_id, parts in bots.items()}))
-    assert exact > 0 and samples > 50, (exact, samples)
-    # relative standard deviation of the estimate is at most about 1 / sqrt(samples)
-    assert abs(estimated - exact) < 5 * exact / samples ** 0.5, (estimated, exact, samples)
+    error = metric_sum(values, 'tgbotapi_heap_estimate_error_bytes')
+    assert exact > 0 and samples > 50 and error > 0, (exact, samples, error)
+    # the server reports standard deviation of the estimate
+    assert abs(estimated - exact) < 5 * error, (estimated, exact, error)
+    for bot_id in [BOT_ID, BOT2_ID]:
+        assert (('tgbotapi_bot_memory_error_bytes', frozenset({('bot', str(bot_id))})) in values), bot_id
     assert abs(sum(sum(parts.values()) for parts in bots.values()) + unattributed - estimated) <= 1, 'parts sum'
     return bots
 

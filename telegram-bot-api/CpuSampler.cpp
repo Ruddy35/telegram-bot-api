@@ -8,6 +8,7 @@
 #include "td/utils/misc.h"
 #include "td/utils/port/platform.h"
 #include "td/utils/Slice.h"
+#include "td/utils/Time.h"
 
 #include <atomic>
 #include <csignal>
@@ -197,7 +198,8 @@ void CpuSampler::start_up() {
     return stop();
   }
 
-  set_timeout_in(FLUSH_PERIOD);
+  next_probe_time_ = td::Time::now() + LAG_PROBE_PERIOD;
+  set_timeout_in(LAG_PROBE_PERIOD);
 #else
   stop();
 #endif
@@ -219,14 +221,29 @@ void CpuSampler::hangup() {
 }
 
 void CpuSampler::timeout_expired() {
-  flush();
-  set_timeout_in(FLUSH_PERIOD);
+  auto now = td::Time::now();
+  auto lag = td::max(now - next_probe_time_, 0.0);
+  std::size_t bucket = 0;
+  while (bucket + 1 < LAG_BUCKET_COUNT && lag > LAG_BUCKETS[bucket]) {
+    bucket++;
+  }
+  lag_.lag_counts[bucket]++;
+  lag_.lag_sum += lag;
+  lag_.max_lag = td::max(lag_.max_lag, lag);
+
+  if (++probe_count_ >= FLUSH_PROBE_COUNT) {
+    probe_count_ = 0;
+    flush();
+  }
+  next_probe_time_ = td::Time::now() + LAG_PROBE_PERIOD;
+  set_timeout_in(LAG_PROBE_PERIOD);
 }
 
 void CpuSampler::flush() {
 #if TELEGRAM_BOT_API_HAVE_CPU_SAMPLER
   CHECK(state_ != nullptr);
-  Samples samples;
+  Samples samples = lag_;
+  lag_ = Samples();
   samples.scheduler_id = td::Scheduler::instance()->sched_id();
   samples.thread_id = static_cast<td::int64>(syscall(SYS_gettid));
 

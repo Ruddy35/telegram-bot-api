@@ -159,8 +159,10 @@ BotMetrics::MemoryStats BotMetrics::get_memory_stats() const {
   auto stats = HeapSampler::get_owner_stats(heap_owner_);
   for (std::size_t part = 0; part < static_cast<std::size_t>(MemoryPart::Size); part++) {
     result.bytes[part] = stats.bytes[part];
+    result.exact_bytes[part] = stats.exact_bytes[part];
   }
   result.sample_count = stats.sample_count;
+  result.variance = stats.variance;
   return result;
 }
 

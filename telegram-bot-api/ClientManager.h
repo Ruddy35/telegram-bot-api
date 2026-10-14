@@ -153,6 +153,13 @@ class ClientManager final : public td::Actor {
   td::int64 unattributed_cpu_samples_ = 0;
   td::vector<double> thread_cpu_times_;  // scheduler identifier -> total CPU time consumed by the thread
   td::vector<td::int64> thread_ids_;     // scheduler identifier -> identifier of the thread in the OS
+  struct SchedulerLag {
+    td::uint64 counts[CpuSampler::LAG_BUCKET_COUNT] = {};
+    double sum = 0.0;
+    double recent_max[60] = {};  // maximum lag for each of the last 60 seconds
+    std::size_t recent_pos = 0;
+  };
+  td::vector<SchedulerLag> scheduler_lags_;  // scheduler identifier -> lag statistics
 
   void start_cpu_sampling();
 

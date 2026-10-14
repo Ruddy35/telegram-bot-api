@@ -22,6 +22,10 @@ class HeapSampler {
   // returns false if allocation functions aren't replaced
   static bool is_supported();
 
+  // returns true if memory of owners is also accounted exactly; enabled by the environment variable
+  // TELEGRAM_BOT_API_MEMORY_AUDIT=1, which adds 16 bytes to every allocation; used to verify the estimates
+  static bool is_audit_enabled();
+
   // sets mean number of allocated bytes between samples; 0 disables the sampling. The current thread uses the new
   // interval immediately, other threads use it after allocating the number of bytes left until their next sample.
   // The sampling is enabled from the start of the process with the interval of 64 KB
@@ -56,18 +60,31 @@ class HeapSampler {
   };
 
   struct OwnerStats {
-    td::int64 bytes[PART_COUNT] = {};  // estimated size of live allocations
-    td::int64 sample_count = 0;        // number of live sampled allocations; relative error is about 1/sqrt(n)
+    td::int64 bytes[PART_COUNT] = {};        // estimated size of live allocations
+    td::int64 sample_count = 0;              // number of live sampled allocations
+    double variance = 0.0;                   // unbiased estimate of the variance of the sum of bytes
+    td::int64 exact_bytes[PART_COUNT] = {};  // exact size of live allocations; only in audit mode
   };
   static OwnerStats get_owner_stats(td::int32 owner);
+
+  static constexpr std::size_t DURATION_BUCKET_COUNT = 6;
+  static constexpr td::uint64 DURATION_BUCKETS_NS[DURATION_BUCKET_COUNT - 1] = {1000, 10000, 100000, 1000000, 10000000};
 
   struct Stats {
     td::int64 live_bytes = 0;              // exact size of all live allocations
     td::int64 estimated_live_bytes = 0;    // estimated size of all live allocations, including unattributed
+    double estimate_variance = 0.0;        // unbiased estimate of the variance of estimated_live_bytes
     td::int64 unattributed_bytes = 0;      // estimated size of allocations not made by any owner
     td::int64 sample_count = 0;            // total number of live sampled allocations
     td::int64 sampled_bytes = 0;           // exact size of live sampled allocations
     td::int64 sampler_overhead_bytes = 0;  // memory used by the sampler itself
+    td::int64 audit_live_bytes = 0;        // exact size of all live allocations as accounted for owners; audit only
+
+    // operations with sampled allocations, which are the only operations taking a lock
+    td::uint64 operation_counts[DURATION_BUCKET_COUNT] = {};  // by duration, including waiting for the lock
+    td::uint64 total_operation_ns = 0;
+    td::uint64 max_operation_ns = 0;
+    td::uint64 max_lock_wait_ns = 0;
   };
   static Stats get_stats();
 };

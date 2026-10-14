@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <tuple>
@@ -713,10 +714,22 @@ void ClientManager::add_bot_metrics(MetricsWriter &writer, const ClientInfo &cli
                           << BotMetrics::get_memory_part_name(static_cast<BotMetrics::MemoryPart>(part)) << '"',
                  memory.bytes[part]);
     }
-    writer.add("tgbotapi_bot_memory_samples", gauge,
-               "Number of live sampled memory allocations of the bot; relative error of tgbotapi_bot_memory_bytes is "
-               "about 1 / sqrt(value)",
-               bot_label, memory.sample_count);
+    writer.add("tgbotapi_bot_memory_samples", gauge, "Number of live sampled memory allocations of the bot", bot_label,
+               memory.sample_count);
+    writer.add("tgbotapi_bot_memory_error_bytes", gauge,
+               "Estimated standard deviation of the sum of tgbotapi_bot_memory_bytes; the real value is within 3 "
+               "standard deviations from the estimate with the probability of at least 89% for any distribution and "
+               "about 99.7% for a normal distribution",
+               bot_label, std::sqrt(td::max(memory.variance, 0.0)));
+    if (HeapSampler::is_audit_enabled()) {
+      for (std::size_t part = 0; part < static_cast<std::size_t>(BotMetrics::MemoryPart::Size); part++) {
+        writer.add("tgbotapi_bot_memory_exact_bytes", gauge,
+                   "Exact size of memory used by the bot, which is counted only in the audit mode",
+                   PSLICE() << bot_label << ",part=\""
+                            << BotMetrics::get_memory_part_name(static_cast<BotMetrics::MemoryPart>(part)) << '"',
+                   memory.exact_bytes[part]);
+      }
+    }
   }
   if (cpu_sampling_period_ > 0.0) {
     for (std::size_t part = 0; part < static_cast<std::size_t>(BotMetrics::CpuPart::Size); part++) {
@@ -833,6 +846,7 @@ void ClientManager::get_metrics(td::Promise<td::BufferSlice> promise,
       auto heap_stats = HeapSampler::get_stats();
       // memory of bots, for which there are no metrics, is unattributed
       td::int64 authorized_bot_memory = 0;
+      td::int64 authorized_bot_exact_memory = 0;
       for (auto id : clients_.ids()) {
         auto *client_info = clients_.get(id);
         CHECK(client_info != nullptr);
@@ -841,8 +855,49 @@ void ClientManager::get_metrics(td::Promise<td::BufferSlice> promise,
           for (auto bytes : memory.bytes) {
             authorized_bot_memory += bytes;
           }
+          for (auto bytes : memory.exact_bytes) {
+            authorized_bot_exact_memory += bytes;
+          }
         }
       }
+      writer.add("tgbotapi_heap_estimate_error_bytes", gauge,
+                 "Estimated standard deviation of tgbotapi_heap_estimated_bytes", td::Slice(),
+                 std::sqrt(td::max(heap_stats.estimate_variance, 0.0)));
+      if (HeapSampler::is_audit_enabled()) {
+        writer.add("tgbotapi_heap_audit_bytes", gauge,
+                   "Exact size of all live memory allocations in the units of the estimates; only in the audit mode",
+                   td::Slice(), heap_stats.audit_live_bytes);
+        writer.add("tgbotapi_memory_unattributed_exact_bytes", gauge,
+                   "Exact size of memory used outside of authorized bots; only in the audit mode", td::Slice(),
+                   heap_stats.audit_live_bytes - authorized_bot_exact_memory);
+      }
+      {
+        const td::Slice name("tgbotapi_memory_sampler_operation_seconds");
+        const td::Slice help(
+            "Duration of operations with sampled allocations, which are the only operations of memory accounting "
+            "taking a lock, including waiting for the lock");
+        td::uint64 cumulative_count = 0;
+        for (std::size_t i = 0; i < HeapSampler::DURATION_BUCKET_COUNT; i++) {
+          cumulative_count += heap_stats.operation_counts[i];
+          char le[32] = "+Inf";
+          if (i + 1 < HeapSampler::DURATION_BUCKET_COUNT) {
+            std::snprintf(le, sizeof(le), "%g", static_cast<double>(HeapSampler::DURATION_BUCKETS_NS[i]) * 1e-9);
+          }
+          writer.add_sample(name, "_bucket", td::Slice("histogram"), help,
+                            PSLICE() << "le=\"" << td::Slice(le, std::strlen(le)) << '"',
+                            static_cast<td::int64>(cumulative_count));
+        }
+        writer.add_sample(name, "_sum", td::Slice("histogram"), help, td::Slice(),
+                          static_cast<double>(heap_stats.total_operation_ns) * 1e-9);
+        writer.add_sample(name, "_count", td::Slice("histogram"), help, td::Slice(),
+                          static_cast<td::int64>(cumulative_count));
+      }
+      writer.add("tgbotapi_memory_sampler_max_operation_seconds", gauge,
+                 "Maximum duration of an operation with a sampled allocation since the start", td::Slice(),
+                 static_cast<double>(heap_stats.max_operation_ns) * 1e-9);
+      writer.add("tgbotapi_memory_sampler_max_lock_wait_seconds", gauge,
+                 "Maximum time of waiting for the lock of memory accounting since the start", td::Slice(),
+                 static_cast<double>(heap_stats.max_lock_wait_ns) * 1e-9);
       writer.add("tgbotapi_heap_bytes", gauge, "Exact size of all live memory allocations of the process", td::Slice(),
                  heap_stats.live_bytes);
       writer.add("tgbotapi_heap_estimated_bytes", gauge,
@@ -870,6 +925,34 @@ void ClientManager::get_metrics(td::Promise<td::BufferSlice> promise,
       for (std::size_t scheduler_id = 0; scheduler_id < thread_cpu_times_.size(); scheduler_id++) {
         writer.add("tgbotapi_thread_cpu_seconds_total", counter, "CPU time consumed by each scheduler thread",
                    PSLICE() << "scheduler=\"" << scheduler_id << '"', thread_cpu_times_[scheduler_id]);
+      }
+      for (std::size_t scheduler_id = 0; scheduler_id < scheduler_lags_.size(); scheduler_id++) {
+        const td::Slice name("tgbotapi_scheduler_lag_seconds");
+        const td::Slice help(
+            "Delay of timer events of each scheduler thread, during which the thread was busy; 20 events per second");
+        auto &lag = scheduler_lags_[scheduler_id];
+        td::string scheduler_label = PSTRING() << "scheduler=\"" << scheduler_id << '"';
+        td::uint64 cumulative_count = 0;
+        for (std::size_t i = 0; i < CpuSampler::LAG_BUCKET_COUNT; i++) {
+          cumulative_count += lag.counts[i];
+          char le[32] = "+Inf";
+          if (i + 1 < CpuSampler::LAG_BUCKET_COUNT) {
+            std::snprintf(le, sizeof(le), "%g", CpuSampler::LAG_BUCKETS[i]);
+          }
+          writer.add_sample(name, "_bucket", td::Slice("histogram"), help,
+                            PSLICE() << scheduler_label << ",le=\"" << td::Slice(le, std::strlen(le)) << '"',
+                            static_cast<td::int64>(cumulative_count));
+        }
+        writer.add_sample(name, "_sum", td::Slice("histogram"), help, scheduler_label, lag.sum);
+        writer.add_sample(name, "_count", td::Slice("histogram"), help, scheduler_label,
+                          static_cast<td::int64>(cumulative_count));
+        double max_lag = 0.0;
+        for (auto value : lag.recent_max) {
+          max_lag = td::max(max_lag, value);
+        }
+        writer.add("tgbotapi_scheduler_max_lag_seconds", gauge,
+                   "Maximum delay of a timer event of each scheduler thread during the last minute", scheduler_label,
+                   max_lag);
       }
       for (std::size_t scheduler_id = 0; scheduler_id < thread_ids_.size(); scheduler_id++) {
         if (thread_ids_[scheduler_id] == 0) {
@@ -1186,6 +1269,7 @@ void ClientManager::start_cpu_sampling() {
   auto thread_count = SharedData::get_thread_count();
   thread_cpu_times_.resize(static_cast<std::size_t>(thread_count));
   thread_ids_.resize(static_cast<std::size_t>(thread_count));
+  scheduler_lags_.resize(static_cast<std::size_t>(thread_count));
   for (td::int32 scheduler_id = 0; scheduler_id < thread_count; scheduler_id++) {
     cpu_samplers_.push_back(td::create_actor_on_scheduler<CpuSampler>(
         "CpuSampler", scheduler_id, cpu_sampling_period_, [actor_id = actor_id(this)](CpuSampler::Samples samples) {
@@ -1203,6 +1287,13 @@ void ClientManager::on_cpu_samples(CpuSampler::Samples samples) {
   if (samples.scheduler_id >= 0 && static_cast<std::size_t>(samples.scheduler_id) < thread_cpu_times_.size()) {
     thread_cpu_times_[samples.scheduler_id] = samples.thread_cpu_time;
     thread_ids_[samples.scheduler_id] = samples.thread_id;
+    auto &lag = scheduler_lags_[samples.scheduler_id];
+    for (std::size_t i = 0; i < CpuSampler::LAG_BUCKET_COUNT; i++) {
+      lag.counts[i] += samples.lag_counts[i];
+    }
+    lag.sum += samples.lag_sum;
+    lag.recent_max[lag.recent_pos] = samples.max_lag;
+    lag.recent_pos = (lag.recent_pos + 1) % 60;
   }
 }
 

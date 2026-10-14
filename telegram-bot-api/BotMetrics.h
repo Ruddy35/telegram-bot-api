@@ -127,6 +127,8 @@ class BotMetrics {
   struct MemoryStats {
     td::int64 bytes[static_cast<std::size_t>(MemoryPart::Size)] = {};
     td::int64 sample_count = 0;
+    double variance = 0.0;                                                   // of the sum of bytes
+    td::int64 exact_bytes[static_cast<std::size_t>(MemoryPart::Size)] = {};  // only in audit mode
   };
   MemoryStats get_memory_stats() const;
 

@@ -483,6 +483,9 @@ void run_bias(const char *name, double interval, double heap_size,
   std::vector<void *> blocks;
   blocks.reserve(static_cast<std::size_t>(heap_size / 8));
   double sum_z = 0, sum_z2 = 0, sum_relative = 0;
+  // coverage of the exact value by the intervals estimate +- k * sigma, where sigma is reported by HeapSampler itself
+  int covered[4] = {};
+  double sum_reported_variance = 0, sum_variance = 0;
   for (int run = 0; run < RUNS; run++) {
     double exact = 0, variance = 0;
     while (exact < heap_size) {
@@ -499,6 +502,19 @@ void run_bias(const char *name, double interval, double heap_size,
     sum_z += z;
     sum_z2 += z * z;
     sum_relative += (static_cast<double>(stats.bytes[0]) - exact) / exact;
+    double reported_error = std::fabs(static_cast<double>(stats.bytes[0]) - exact);
+    for (int k = 1; k <= 3; k++) {
+      if (reported_error <= k * std::sqrt(std::max(stats.variance, 0.0))) {
+        covered[k]++;
+      }
+    }
+    sum_reported_variance += stats.variance;
+    sum_variance += variance;
+    if (HeapSampler::is_audit_enabled()) {
+      // the exact size, which is used to verify the estimates on a real server, must be exact
+      CHECK_TEST(static_cast<double>(stats.exact_bytes[0]) == exact, "%s: audit size %lld instead of %.0f", name,
+                 static_cast<long long>(stats.exact_bytes[0]), exact);
+    }
     set_context(0xF000);
     for (auto p : blocks) {
       free(p);
@@ -514,6 +530,16 @@ void run_bias(const char *name, double interval, double heap_size,
       name, interval / 1024, RUNS, heap_size / 1e6, sum_relative / RUNS * 100, mean, 3 / std::sqrt(RUNS * 1.0), stddev);
   CHECK_TEST(std::fabs(mean) < 3 / std::sqrt(RUNS * 1.0), "%s: biased estimate, z mean %.3f", name, mean);
   CHECK_TEST(stddev > 0.8 && stddev < 1.2, "%s: wrong variance, z stddev %.2f", name, stddev);
+  double variance_ratio = sum_reported_variance / sum_variance;
+  std::printf(
+      "%-34s reported sigma: variance / theoretical %.3f, exact value within 1/2/3 sigma: %.1f%%/%.1f%%/%.1f%%\n", "",
+      variance_ratio, covered[1] * 100.0 / RUNS, covered[2] * 100.0 / RUNS, covered[3] * 100.0 / RUNS);
+  // the reported variance is an unbiased estimate, so its mean over the runs must be close to the theoretical variance
+  CHECK_TEST(std::fabs(variance_ratio - 1) < 0.1, "%s: biased variance estimate, ratio %.3f", name, variance_ratio);
+  // normal distribution gives 68.3%, 95.4% and 99.7%; the bounds allow for the binomial noise of 200 runs
+  CHECK_TEST(covered[1] >= RUNS * 0.58, "%s: exact value is within 1 sigma in %d runs", name, covered[1]);
+  CHECK_TEST(covered[2] >= RUNS * 0.90, "%s: exact value is within 2 sigma in %d runs", name, covered[2]);
+  CHECK_TEST(covered[3] >= RUNS * 0.98, "%s: exact value is within 3 sigma in %d runs", name, covered[3]);
   HeapSampler::remove_context(0xF000, owner);
   HeapSampler::destroy_owner(owner);
   HeapSampler::set_sampling_interval(0);
@@ -704,8 +730,10 @@ void test_edge() {
   }
   int page_aligned = 0;
   for (auto p : empty_blocks) {
-    // usable size of sampled empty blocks is 0; the real allocator can return page-aligned pointers
-    page_aligned += (reinterpret_cast<std::uintptr_t>(p) & 4095) == 0 && malloc_usable_size(p) == 0;
+    // usable size of sampled empty blocks is 0; the real allocator can return page-aligned pointers, and in the audit
+    // mode usable size of a block of the real allocator can be 0 too
+    page_aligned += (reinterpret_cast<std::uintptr_t>(p) & 4095) == 0 && malloc_usable_size(p) == 0 &&
+                    !HeapSampler::is_audit_enabled();
     // 0 for sampled blocks, at least 24 for glibc, which can return a slightly bigger free chunk; a wrong lookup
     // would return the size of another block
     CHECK_TEST(malloc_usable_size(p) <= 64, "usable size of an empty block");

@@ -20,7 +20,14 @@ namespace telegram_bot_api {
 // Samples are periodically collected by the thread itself and passed to the callback on the same thread.
 class CpuSampler final : public td::Actor {
  public:
+  // lag of the scheduler is the delay of a timer event, during which the thread was busy with something else
+  static constexpr std::size_t LAG_BUCKET_COUNT = 7;
+  static constexpr double LAG_BUCKETS[LAG_BUCKET_COUNT - 1] = {0.001, 0.005, 0.01, 0.05, 0.1, 0.5};
+
   struct Samples {
+    td::uint64 lag_counts[LAG_BUCKET_COUNT] = {};  // since the previous samples
+    double lag_sum = 0.0;
+    double max_lag = 0.0;
     td::int32 scheduler_id = 0;
     td::int64 thread_id = 0;                                  // identifier of the thread in the OS
     double thread_cpu_time = 0.0;                             // total CPU time consumed by the thread
@@ -48,11 +55,15 @@ class CpuSampler final : public td::Actor {
   struct ThreadState;
 
  private:
-  static constexpr double FLUSH_PERIOD = 1.0;
+  static constexpr double LAG_PROBE_PERIOD = 0.05;
+  static constexpr int FLUSH_PROBE_COUNT = 20;  // samples are flushed every second
 
   double period_;
   Callback callback_;
   td::unique_ptr<ThreadState> state_;
+  double next_probe_time_ = 0.0;
+  int probe_count_ = 0;
+  Samples lag_;
 
   void start_up() final;
 
