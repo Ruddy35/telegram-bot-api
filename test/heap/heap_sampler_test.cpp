@@ -11,6 +11,7 @@
 
 #include "td/actor/actor.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -77,7 +78,7 @@ double chunk_size(std::size_t size) {
 }
 
 double sample_variance(std::size_t size, double interval) {
-  double p = -std::expm1(-static_cast<double>(size + 1) / interval);
+  double p = -std::expm1(-static_cast<double>(size + 16) / interval);
   double c = chunk_size(size);
   return c * c * (1 - p) / p;
 }
@@ -1181,35 +1182,24 @@ int main(int argc, char *argv[]) {
   if (!HeapSampler::is_supported()) {
     return 1;
   }
-  std::vector<std::string> tests;
-  for (int i = 1; i < argc; i++) {
-    tests.push_back(argv[i]);
-  }
-  if (tests.empty()) {
-    tests = {"stress", "exact", "attribution", "edge", "api", "limits", "drift", "bias", "accuracy", "overhead"};
-  }
-  for (auto &test : tests) {
-    if (test == "stress") {
-      test_stress();
-    } else if (test == "accuracy") {
-      test_accuracy();
-    } else if (test == "bias") {
-      test_bias();
-    } else if (test == "attribution") {
-      test_attribution();
-    } else if (test == "drift") {
-      test_drift();
-    } else if (test == "exact") {
-      test_exact();
-    } else if (test == "edge") {
-      test_edge();
-    } else if (test == "api") {
-      test_api();
-    } else if (test == "limits") {
-      test_limits();
-    } else if (test == "overhead") {
-      test_overhead();
+  const std::vector<std::pair<std::string, void (*)()>> all_tests = {
+      {"stress", test_stress},    {"exact", test_exact}, {"attribution", test_attribution},
+      {"edge", test_edge},        {"api", test_api},     {"limits", test_limits},
+      {"drift", test_drift},      {"bias", test_bias},   {"accuracy", test_accuracy},
+      {"overhead", test_overhead}};
+  std::vector<std::string> names(argv + 1, argv + argc);
+  if (names.empty()) {
+    for (auto &test : all_tests) {
+      names.push_back(test.first);
     }
+  }
+  for (auto &name : names) {
+    auto it = std::find_if(all_tests.begin(), all_tests.end(), [&](const auto &test) { return test.first == name; });
+    if (it == all_tests.end()) {
+      std::printf("unknown test %s\n", name.c_str());
+      return 2;
+    }
+    it->second();
   }
   std::printf(failures == 0 ? "ALL CHECKS PASSED\n" : "%d CHECKS FAILED\n", failures);
   return failures == 0 ? 0 : 1;

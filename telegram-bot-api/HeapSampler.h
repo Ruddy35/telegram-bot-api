@@ -13,7 +13,7 @@ namespace telegram_bot_api {
 // The memory allocation functions and the C++ operators new and delete are replaced. The replacements forward calls to
 // the next allocator in the symbol lookup order (glibc or an allocator loaded with LD_PRELOAD) and
 //  - count the total size of live allocations exactly, in sizes of chunks of the real allocator;
-//  - sample allocations: an allocation of n bytes is sampled with the probability p = 1 - exp(-(n + 1) / interval),
+//  - sample allocations: an allocation of n bytes is sampled with the probability p = 1 - exp(-(n + 16) / interval),
 //    independently of other allocations, and is accounted with the weight chunk / p for the owner of the actor context,
 //    in which it was made. The sum of weights of live sampled allocations of an owner is an unbiased estimate of the
 //    total size of its live allocations; the sum of weight * (weight - chunk) is an unbiased estimate of the variance.

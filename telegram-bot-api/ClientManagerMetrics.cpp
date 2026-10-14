@@ -31,7 +31,7 @@
 namespace telegram_bot_api {
 
 namespace {
-const char *const REJECT_REASON_NAMES[] = {"closing",   "invalid_token",  "misdirected_token",
+const char *const REJECT_REASON_NAMES[] = {"closing",    "invalid_token",  "misdirected_token",
                                            "closed_bot", "ip_flood_limit", "global_flood_limit"};
 
 td::string get_scheduler_label(std::size_t scheduler_id) {
@@ -205,7 +205,8 @@ void ClientManager::add_server_metrics(MetricsWriter &writer, double now, td::in
     writer.add("tgbotapi_process_disk_read_bytes_total", td::Slice(), r_io_stat.ok().read_bytes);
     writer.add("tgbotapi_process_disk_written_bytes_total", td::Slice(), r_io_stat.ok().written_bytes);
   }
-  writer.add("tgbotapi_buffer_memory_bytes", td::Slice(), static_cast<td::int64>(td::BufferAllocator::get_buffer_mem()));
+  writer.add("tgbotapi_buffer_memory_bytes", td::Slice(),
+             static_cast<td::int64>(td::BufferAllocator::get_buffer_mem()));
 
   // memory accounting
   if (HeapSampler::get_sampling_interval() > 0) {
@@ -227,8 +228,8 @@ void ClientManager::add_server_metrics(MetricsWriter &writer, double now, td::in
     for (std::size_t i = 0; i < bounds.size(); i++) {
       bounds[i] = static_cast<double>(HeapSampler::DURATION_BUCKETS_NS[i]) * 1e-9;
     }
-    writer.add_histogram("tgbotapi_memory_sampler_operation_seconds", td::Slice(), bounds,
-                         heap_stats.operation_counts, static_cast<double>(heap_stats.total_operation_ns) * 1e-9);
+    writer.add_histogram("tgbotapi_memory_sampler_operation_seconds", td::Slice(), bounds, heap_stats.operation_counts,
+                         static_cast<double>(heap_stats.total_operation_ns) * 1e-9);
     writer.add("tgbotapi_memory_sampler_max_operation_seconds", td::Slice(),
                static_cast<double>(heap_stats.max_operation_ns) * 1e-9);
     writer.add("tgbotapi_memory_sampler_max_lock_wait_seconds", td::Slice(),
@@ -271,9 +272,8 @@ void ClientManager::add_server_metrics(MetricsWriter &writer, double now, td::in
   writer.add("tgbotapi_tqueue_expired_updates_total", td::Slice(), tqueue_deleted_events_);
   writer.add("tgbotapi_tdlib_restarts_total", td::Slice(), total_restart_count_);
   writer.add("tgbotapi_tdlib_failed_restarts_total", td::Slice(), total_failed_restart_count_);
-  static_assert(sizeof(REJECT_REASON_NAMES) / sizeof(REJECT_REASON_NAMES[0]) ==
-                    static_cast<std::size_t>(RejectReason::Size),
-                "");
+  static_assert(
+      sizeof(REJECT_REASON_NAMES) / sizeof(REJECT_REASON_NAMES[0]) == static_cast<std::size_t>(RejectReason::Size), "");
   for (std::size_t reason = 0; reason < rejected_queries_.size(); reason++) {
     writer.add("tgbotapi_rejected_requests_total", PSLICE() << "reason=\"" << REJECT_REASON_NAMES[reason] << '"',
                rejected_queries_[reason]);
@@ -317,7 +317,8 @@ void ClientManager::add_bot_metrics(MetricsWriter &writer, const ClientInfo &cli
   writer.add("tgbotapi_bot_pending_updates", bot_label, static_cast<td::int64>(bot_info.pending_update_count_));
 
   auto cache_stats = client->get_cache_stats();
-  writer.add("tgbotapi_bot_active_file_downloads", bot_label, static_cast<td::int64>(cache_stats.active_download_count));
+  writer.add("tgbotapi_bot_active_file_downloads", bot_label,
+             static_cast<td::int64>(cache_stats.active_download_count));
   writer.add("tgbotapi_bot_pending_update_chats", bot_label,
              static_cast<td::int64>(cache_stats.pending_update_chat_count));
   writer.add("tgbotapi_bot_pending_sent_messages", bot_label,

@@ -60,6 +60,9 @@ constexpr std::size_t MAX_SMALL_SLOT_SIZE = 2048;
 constexpr std::size_t SMALL_CLASS_COUNT = MAX_SMALL_SLOT_SIZE / 16 + 1;
 constexpr td::uint32 NO_PAGE = 0xFFFFFFFFu;
 constexpr td::int64 DISABLED_RECHECK_BYTES = 1 << 20;
+// an allocation of n bytes covers n + SAMPLING_EXTRA_BYTES bytes of the sampling process; the extra bytes approximate
+// the header of a chunk, so weights of small allocations are close to the interval, and empty allocations can be sampled
+constexpr td::int64 SAMPLING_EXTRA_BYTES = 16;
 constexpr td::int64 DEFAULT_SAMPLING_INTERVAL = static_cast<td::int64>(64) << 10;
 constexpr td::int64 MAX_SAMPLING_INTERVAL = static_cast<td::int64>(1) << 40;
 // sampled blocks of at least this size are mapped with commit accounting; glibc uses mmap for blocks of this size too
@@ -308,8 +311,8 @@ double next_random() {
 
 // Points of a Poisson process with the mean distance of `interval` bytes are placed on the bytes allocated by the
 // thread. The distance to the next point is exponentially distributed, i.e. P(distance > k) = exp(-k / interval)
-// regardless of the past, so an allocation, which covers n + 1 bytes, contains a point with the probability
-// 1 - exp(-(n + 1) / interval) independently of all other allocations.
+// regardless of the past, so an allocation, which covers k = n + SAMPLING_EXTRA_BYTES bytes, contains a point with the
+// probability 1 - exp(-k / interval) independently of all other allocations.
 void reset_countdown() {
   auto interval = sampling_interval.load(std::memory_order_relaxed);
   if (interval > 0) {
@@ -327,12 +330,11 @@ td::int64 need_sample_slow(std::size_t size) {
   return size <= MAX_SAMPLED_SIZE ? interval : 0;
 }
 
-// returns the sampling interval if the allocation must be sampled or 0 otherwise; an allocation of n bytes covers
-// n + 1 bytes of the sampling process, so even empty allocations can be sampled
+// returns the sampling interval if the allocation must be sampled or 0 otherwise
 inline td::int64 need_sample(std::size_t size) {
   auto left = countdown;
-  if (__builtin_expect(static_cast<td::uint64>(left) > static_cast<td::uint64>(size) + 1, 1)) {
-    countdown = left - static_cast<td::int64>(size) - 1;
+  if (__builtin_expect(static_cast<td::uint64>(left) > static_cast<td::uint64>(size) + SAMPLING_EXTRA_BYTES, 1)) {
+    countdown = left - static_cast<td::int64>(size) - SAMPLING_EXTRA_BYTES;
     return 0;
   }
   return need_sample_slow(size);
@@ -691,7 +693,8 @@ void add_owner_sample(SampleInfo &info, td::uint64 context, td::int32 sign) {
 }
 
 td::int64 get_sample_weight(std::size_t size, td::int64 chunk, td::int64 interval) {
-  double probability = -std::expm1(-static_cast<double>(size + 1) / static_cast<double>(interval));
+  double probability =
+      -std::expm1(-static_cast<double>(size + SAMPLING_EXTRA_BYTES) / static_cast<double>(interval));
   return static_cast<td::int64>(std::llround(static_cast<double>(chunk) / probability));
 }
 

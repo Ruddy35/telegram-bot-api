@@ -188,7 +188,7 @@ def run_offline_server(options, interval, run, rng, work):
         for token, _ in testlib.BOTS:
             assert server.api('getMe', token=token)[0]['ok']
         if run % 2 == 1:
-            # memory of the first TDLib instance becomes unattributed; the new instance is accounted from scratch
+            # check the estimates after a restart too: memory of the closed instance is freed, the new one is accounted
             server.stats('?restart=%d' % testlib.BOT_ID)
             testlib.wait_for(lambda: int(server.stats().get('tdlib_restart_count', 0)) >= 1, 60, 'restart')
         # messages can't be sent without network access, so they stay in memory of the bots;

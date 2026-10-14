@@ -133,7 +133,8 @@ class BotMetrics {
   std::map<td::int32, MethodStats> methods_;  // method_id -> statistics
 
   // durations of answered requests except getUpdates
-  static constexpr double DURATION_BUCKETS[] = {0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0};
+  static constexpr double DURATION_BUCKETS[] = {0.005, 0.01, 0.025, 0.05, 0.1,  0.25, 0.5,
+                                                1.0,   2.5,  5.0,   10.0, 30.0, 60.0};
   std::array<td::uint64, sizeof(DURATION_BUCKETS) / sizeof(DURATION_BUCKETS[0]) + 1> duration_counts_{};
   double duration_sum_ = 0.0;
 
