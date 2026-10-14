@@ -11,6 +11,7 @@
 # Usage:
 #   cmake --build <build dir> --target telegram-bot-api restart-test-fake-auth restart-test-fake-updates
 #   python3 test/restart/restart_test.py <build dir> [webhook] [polling] [drain_timeout] [policy] [metrics] [resources]
+#                                        [memory]
 #
 import collections
 import json
@@ -28,6 +29,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BOT_ID = 1087968824  # @GroupAnonymousBot; TDLib knows the user without network access, so getMe works offline
 TOKEN = '%d:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw' % BOT_ID
+BOT2_ID = 136817688  # @Channel_Bot, also known to TDLib without network access
+TOKEN2 = '%d:AAGq7rGkXmpVZ3bNzE9tP1yLcW4sDfHjKlQ' % BOT2_ID
 API_PORT = 18081
 STAT_PORT = 18082
 HOOK_PORT = 18083
@@ -69,9 +72,9 @@ class Hook(BaseHTTPRequestHandler):
         pass
 
 
-def api(method, timeout=60, **params):
+def api(method, timeout=60, token=None, **params):
     data = json.dumps(params).encode()
-    req = urllib.request.Request('http://127.0.0.1:%d/bot%s/%s' % (API_PORT, TOKEN, method), data=data,
+    req = urllib.request.Request('http://127.0.0.1:%d/bot%s/%s' % (API_PORT, token or TOKEN, method), data=data,
                                  headers={'Content-Type': 'application/json'})
     start = time.time()
     try:
@@ -81,6 +84,8 @@ def api(method, timeout=60, **params):
         result = json.loads(e.read())
     except OSError as e:
         return {'ok': False, 'description': str(e)}, time.time() - start
+    if token is not None:
+        return result, time.time() - start
     with API_CALLS_LOCK:
         # the server counts requests to non-existing methods as requests to the method "unknown"
         stat_method = 'unknown' if method == 'unknownMethod' else method.lower()
@@ -118,9 +123,9 @@ def check_request_metrics():
     with API_CALLS_LOCK:
         calls = dict(API_CALLS)
     for (method, code), count in sorted(calls.items()):
-        counted = metric_sum(values, 'tgbotapi_bot_requests_total', method=method, code=code)
+        counted = metric_sum(values, 'tgbotapi_bot_requests_total', bot=BOT_ID, method=method, code=code)
         assert counted == count, (method, code, count, counted)
-    total = metric_sum(values, 'tgbotapi_bot_requests_total')
+    total = metric_sum(values, 'tgbotapi_bot_requests_total', bot=BOT_ID)
     assert total == sum(calls.values()), (total, sum(calls.values()))
     log('metrics: %d answered requests are counted exactly' % total)
     return values
@@ -137,13 +142,14 @@ def stats(query=''):
     return result
 
 
-def prepare(name, update_count):
+def prepare(name, update_count, second_bot=False):
     work = os.path.join(WORK_ROOT, name)
     if os.path.exists(work):
         shutil.rmtree(work)
-    os.makedirs(os.path.join(work, TOKEN))
-    subprocess.run([os.path.join(BUILD_DIR, 'restart-test-fake-auth'), os.path.join(work, TOKEN, 'td.binlog'),
-                    str(BOT_ID)], check=True, capture_output=True)
+    for token, bot_id in [(TOKEN, BOT_ID)] + ([(TOKEN2, BOT2_ID)] if second_bot else []):
+        os.makedirs(os.path.join(work, token))
+        subprocess.run([os.path.join(BUILD_DIR, 'restart-test-fake-auth'), os.path.join(work, token, 'td.binlog'),
+                        str(bot_id)], check=True, capture_output=True)
     if update_count:
         subprocess.run([os.path.join(BUILD_DIR, 'restart-test-fake-updates'), os.path.join(work, 'tqueue.binlog'),
                         str(BOT_ID), str(update_count)], check=True, capture_output=True)
@@ -450,13 +456,102 @@ def scenario_resources():
         stop_server(proc)
 
 
+def check_memory_metrics(values):
+    """Checks consistency of memory accounting and returns memory of the bots."""
+    exact = metric_sum(values, 'tgbotapi_heap_bytes')
+    estimated = metric_sum(values, 'tgbotapi_heap_estimated_bytes')
+    samples = metric_sum(values, 'tgbotapi_memory_samples')
+    unattributed = metric_sum(values, 'tgbotapi_memory_unattributed_bytes')
+    bots = {}
+    for bot_id in [BOT_ID, BOT2_ID]:
+        bots[bot_id] = {part: metric_sum(values, 'tgbotapi_bot_memory_bytes', bot=bot_id, part=part)
+                        for part in ['client', 'tdlib', 'updates']}
+    log('memory: heap %.1f MB, estimated %.1f MB (%d samples), unattributed %.1f MB, bots %s' % (
+        exact / 1e6, estimated / 1e6, samples, unattributed / 1e6,
+        {bot_id: {part: round(value / 1e6, 2) for part, value in parts.items()} for bot_id, parts in bots.items()}))
+    assert exact > 0 and samples > 50, (exact, samples)
+    # relative standard deviation of the estimate is at most about 1 / sqrt(samples)
+    assert abs(estimated - exact) < 5 * exact / samples ** 0.5, (estimated, exact, samples)
+    assert abs(sum(sum(parts.values()) for parts in bots.values()) + unattributed - estimated) <= 1, 'parts sum'
+    return bots
+
+
+def scenario_memory():
+    """Memory of each bot is estimated, attributed to the right bot and is used to restart TDLib instances."""
+    work = prepare('memory', 0, second_bot=True)
+    proc = start_server(work, '--memory-sampling-interval=16')
+    try:
+        assert api('getMe')[0]['ok']
+        assert api('getMe', token=TOKEN2)[0]['ok']
+        time.sleep(1)
+        values = metrics()
+        heap_before = metric_sum(values, 'tgbotapi_heap_bytes')
+        before = check_memory_metrics(values)
+        for bot_id in [BOT_ID, BOT2_ID]:
+            assert before[bot_id]['tdlib'] > 0, before
+
+        # messages, which are being sent by the first bot, stay in memory of its TDLib instance and Bot API client
+        def send_messages(thread_index):
+            for i in range(250):
+                api('sendMessage', timeout=0.1, chat_id=BOT_ID, text='message %d %d %s' % (thread_index, i, 'x' * 2000))
+
+        threads = [threading.Thread(target=send_messages, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        time.sleep(2)
+        values = metrics()
+        heap_growth = metric_sum(values, 'tgbotapi_heap_bytes') - heap_before
+        after = check_memory_metrics(values)
+        growth = {bot_id: sum(after[bot_id].values()) - sum(before[bot_id].values()) for bot_id in after}
+        log('memory growth: heap %.1f MB, bot 1 %.1f MB, bot 2 %.1f MB' % (
+            heap_growth / 1e6, growth[BOT_ID] / 1e6, growth[BOT2_ID] / 1e6))
+        # the rest is used by HTTP connections and requests, which aren't attributed to bots
+        assert heap_growth > 1e6 and growth[BOT_ID] > 0.5 * heap_growth, (heap_growth, growth)
+        assert abs(growth[BOT2_ID]) < 0.1 * growth[BOT_ID], growth
+    finally:
+        stop_server(proc)
+
+    # only the bot, which exceeds the memory limit, is restarted, and restarts don't leak memory
+    work = prepare('memory_limit', 0, second_bot=True)
+    proc = start_server(work, '--memory-sampling-interval=4', '--tdlib-restart-bot-memory-limit=1',
+                        '--tdlib-restart-min-uptime=2', '--tdlib-restart-cooldown=1')
+    try:
+        assert api('getMe')[0]['ok']
+        assert api('getMe', token=TOKEN2)[0]['ok']
+        load = Load(['getMe', 'getWebhookInfo'], threads=4)
+        wait_for(lambda: restart_count() >= 1, 60, 'restart because of the bot memory limit')
+        time.sleep(1)
+        values = metrics()
+        first_heap = metric_sum(values, 'tgbotapi_heap_bytes')
+        first = check_memory_metrics(values)
+        wait_for(lambda: restart_count() >= 6, 60, 'restarts because of the bot memory limit')
+        time.sleep(1)
+        load.finish()
+        values = check_request_metrics()
+        last_heap = metric_sum(values, 'tgbotapi_heap_bytes')
+        last = check_memory_metrics(values)
+        log('after 1 restart: heap %.2f MB, bot %.2f MB; after 6 restarts: heap %.2f MB, bot %.2f MB' % (
+            first_heap / 1e6, sum(first[BOT_ID].values()) / 1e6, last_heap / 1e6, sum(last[BOT_ID].values()) / 1e6))
+        assert metric_sum(values, 'tgbotapi_bot_tdlib_restarts_total', bot=BOT_ID) >= 6
+        assert sum(first[BOT2_ID].values()) < 1 << 20, first
+        assert metric_sum(values, 'tgbotapi_bot_tdlib_restarts_total', bot=BOT2_ID) == 0, 'bot below the limit'
+        assert last_heap < 1.1 * first_heap, 'memory leak'
+        assert abs(sum(last[BOT_ID].values()) - sum(first[BOT_ID].values())) < 0.25 * sum(first[BOT_ID].values())
+        with open(os.path.join(work, 'log.txt'), errors='replace') as f:
+            assert 'because of bot memory limit' in f.read()
+    finally:
+        stop_server(proc)
+
+
 def main():
     global BUILD_DIR, WORK_ROOT
     if len(sys.argv) < 2:
         print(__doc__ or 'Usage: restart_test.py <build dir> [scenario]...')
         sys.exit(1)
     BUILD_DIR = os.path.abspath(sys.argv[1])
-    scenarios = sys.argv[2:] or ['webhook', 'polling', 'drain_timeout', 'policy', 'metrics', 'resources']
+    scenarios = sys.argv[2:] or ['webhook', 'polling', 'drain_timeout', 'policy', 'metrics', 'resources', 'memory']
     WORK_ROOT = tempfile.mkdtemp(prefix='telegram-bot-api-restart-test-')
     try:
         for scenario in scenarios:

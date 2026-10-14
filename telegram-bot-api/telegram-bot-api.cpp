@@ -6,6 +6,7 @@
 //
 #include "telegram-bot-api/ClientManager.h"
 #include "telegram-bot-api/ClientParameters.h"
+#include "telegram-bot-api/HeapSampler.h"
 #include "telegram-bot-api/HttpConnection.h"
 #include "telegram-bot-api/HttpServer.h"
 #include "telegram-bot-api/HttpStatConnection.h"
@@ -190,6 +191,8 @@ int main(int argc, char *argv[]) {
   td::uint64 max_connections = 0;
   td::int32 tdlib_restart_interval = 0;
   td::int64 tdlib_restart_memory_limit = 0;
+  td::int64 tdlib_restart_bot_memory_limit = 0;
+  td::int64 memory_sampling_interval = parameters->memory_sampling_interval_ >> 10;
   td::int32 tdlib_restart_min_uptime = static_cast<td::int32>(parameters->tdlib_restart_min_uptime_);
   td::int32 tdlib_restart_drain_timeout = static_cast<td::int32>(parameters->tdlib_restart_drain_timeout_);
   td::int32 tdlib_restart_cooldown = static_cast<td::int32>(parameters->tdlib_restart_cooldown_);
@@ -265,6 +268,11 @@ int main(int argc, char *argv[]) {
                              "gracefully restart TDLib instances of the most active bots one by one while memory usage "
                              "of the server exceeds the specified number of megabytes (disabled by default)",
                              td::OptionParser::parse_integer(tdlib_restart_memory_limit));
+  options.add_checked_option('\0', "tdlib-restart-bot-memory-limit",
+                             "gracefully restart TDLib instance of a bot, which uses more than the specified number of "
+                             "megabytes of memory together with its Bot API cache, excluding pending updates; requires "
+                             "memory accounting (disabled by default)",
+                             td::OptionParser::parse_integer(tdlib_restart_bot_memory_limit));
   options.add_checked_option('\0', "tdlib-restart-min-uptime",
                              PSLICE() << "minimum uptime in seconds of a TDLib instance before it can be restarted "
                                          "because of the memory limit (default is "
@@ -291,6 +299,11 @@ int main(int argc, char *argv[]) {
                                          "estimate CPU time consumed by each bot; 0 disables the sampling (default is "
                                       << parameters->cpu_sampling_rate_ << ")",
                              td::OptionParser::parse_integer(parameters->cpu_sampling_rate_));
+  options.add_checked_option('\0', "memory-sampling-interval",
+                             PSLICE() << "mean number of kilobytes of allocated memory between samples, which are used "
+                                         "to estimate memory used by each bot; 0 disables the accounting (default is "
+                                      << memory_sampling_interval << ")",
+                             td::OptionParser::parse_integer(memory_sampling_interval));
   options.add_checked_option('\0', "http-ip-address",
                              "local IP address, HTTP connections to which will be accepted. By default, connections to "
                              "any local IPv4 address are accepted",
@@ -369,6 +382,12 @@ int main(int argc, char *argv[]) {
     }
     if (parameters->cpu_sampling_rate_ < 0 || parameters->cpu_sampling_rate_ > 1000) {
       return td::Status::Error("CPU sampling rate must be between 0 and 1000");
+    }
+    if (memory_sampling_interval < 0 || memory_sampling_interval > (1 << 20)) {
+      return td::Status::Error("Memory sampling interval must be between 0 and 1048576 kilobytes");
+    }
+    if (tdlib_restart_bot_memory_limit < 0 || tdlib_restart_bot_memory_limit > (static_cast<td::int64>(1) << 30)) {
+      return td::Status::Error("Wrong TDLib restart bot memory limit specified");
     }
     return td::Status::OK();
   });
@@ -546,6 +565,8 @@ int main(int argc, char *argv[]) {
 
   parameters->tdlib_restart_interval_ = static_cast<double>(tdlib_restart_interval);
   parameters->tdlib_restart_memory_limit_ = tdlib_restart_memory_limit << 20;
+  parameters->tdlib_restart_bot_memory_limit_ = tdlib_restart_bot_memory_limit << 20;
+  parameters->memory_sampling_interval_ = memory_sampling_interval << 10;
   parameters->tdlib_restart_min_uptime_ = static_cast<double>(tdlib_restart_min_uptime);
   parameters->tdlib_restart_drain_timeout_ = static_cast<double>(tdlib_restart_drain_timeout);
   parameters->tdlib_restart_cooldown_ = static_cast<double>(tdlib_restart_cooldown);
@@ -567,6 +588,18 @@ int main(int argc, char *argv[]) {
   // LOG(WARNING) << "Bot API server with commit " << td::GitInfo::commit() << ' '
   //              << (td::GitInfo::is_dirty() ? "(dirty)" : "") << " started";
   LOG(WARNING) << "Bot API " << parameters->version_ << " server started";
+
+  // must be enabled before creation of scheduler threads, so they sample allocations from the start
+  if (parameters->memory_sampling_interval_ > 0) {
+    if (HeapSampler::is_supported()) {
+      HeapSampler::set_sampling_interval(parameters->memory_sampling_interval_);
+    } else {
+      LOG(WARNING) << "Memory accounting isn't supported by the build";
+    }
+  }
+  if (HeapSampler::get_sampling_interval() <= 0) {
+    parameters->memory_sampling_interval_ = 0;
+  }
 
   td::ConcurrentScheduler sched(SharedData::get_thread_count() - 1, cpu_affinity);
 

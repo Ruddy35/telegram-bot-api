@@ -7,6 +7,7 @@
 #include "telegram-bot-api/Client.h"
 
 #include "telegram-bot-api/ClientParameters.h"
+#include "telegram-bot-api/HeapSampler.h"
 
 #include "td/db/TQueue.h"
 
@@ -62,7 +63,7 @@ Client::Client(td::ActorShared<> parent, const td::string &bot_token, bool is_te
 
 Client::~Client() {
   for (auto context : cpu_contexts_) {
-    BotMetrics::unregister_cpu_context(context, this);
+    BotMetrics::unregister_context(context, this);
   }
   td::Scheduler::instance()->destroy_on_scheduler(SharedData::get_file_gc_scheduler_id(), messages_, users_, groups_,
                                                   supergroups_, chats_, communities_, sticker_set_names_);
@@ -8956,7 +8957,7 @@ void Client::start_up() {
   set_context(context);
   set_tag(bot_token_id_);
   cpu_contexts_.push_back(reinterpret_cast<td::uint64>(context.get()));
-  metrics_->register_cpu_context(cpu_contexts_.back(), BotMetrics::CpuPart::Client, this);
+  metrics_->register_context(cpu_contexts_.back(), BotMetrics::CpuPart::Client, this);
 
   auto suff = bot_token_with_dc_ + TD_DIR_SLASH;
   if (!parameters_->allow_colon_in_filenames_) {
@@ -9009,7 +9010,7 @@ void Client::on_tdlib_context(td::uint64 context) {
     return;
   }
   cpu_contexts_.push_back(context);
-  metrics_->register_cpu_context(context, BotMetrics::CpuPart::Tdlib, this);
+  metrics_->register_context(context, BotMetrics::CpuPart::Tdlib, this);
 }
 
 void Client::send(PromisedQueryPtr query) {
@@ -18858,8 +18859,12 @@ void Client::add_update_impl(UpdateType update_type, const td::VirtuallyJsonable
   }
 
   auto update_slice = jb.string_builder().as_cslice();
-  auto r_id = parameters_->shared_data_->tqueue_->push(tqueue_id_, update_slice.str(), get_unix_time() + timeout,
-                                                       webhook_queue_id, td::TQueue::EventId());
+  auto r_id = [&] {
+    // memory of queued updates isn't released by restarts of the TDLib instance, so it is accounted separately
+    HeapSampler::PartGuard guard(static_cast<td::int32>(BotMetrics::MemoryPart::Updates));
+    return parameters_->shared_data_->tqueue_->push(tqueue_id_, update_slice.str(), get_unix_time() + timeout,
+                                                    webhook_queue_id, td::TQueue::EventId());
+  }();
   if (r_id.is_ok()) {
     metrics_->on_update(static_cast<int32>(update_type), BotMetrics::UpdateResult::Queued);
     auto id = r_id.move_as_ok();

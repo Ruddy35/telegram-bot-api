@@ -122,14 +122,22 @@ See [MEMORY.md](MEMORY.md) for details (in Russian).
 `GET http://<stat address>:<stat port>/metrics` returns metrics in the Prometheus text format for VictoriaMetrics or
 Prometheus: requests by method, HTTP status code and failure reason, answer time, request and answer sizes, requests
 abandoned by clients, files sent by upload, local path, file_id or URL, file downloads by result, updates by type,
-webhook deliveries, disk usage, Bot API cache sizes, numbers of objects in memory of TDLib instances, estimated CPU time
-and graceful restarts of TDLib instances of each bot.
+webhook deliveries, disk usage, Bot API cache sizes, numbers of objects in memory of TDLib instances, estimated memory
+usage and CPU time, and graceful restarts of TDLib instances of each bot.
 `?bot=<bot_id>` limits the output to a single bot. See [METRICS.md](METRICS.md) for details (in Russian).
 
 CPU time of each bot is estimated by sampling: each thread is interrupted with `SIGPROF` after every 10 milliseconds of
 its CPU time and the current actor context is remembered. Use `--cpu-sampling-rate` to change the number of samples
 per second of CPU time or `--cpu-sampling-rate=0` to disable the sampling. The sampling is supported only on Linux.
 Disable the sampling to use other profilers based on `SIGPROF`, for example, gperftools or gprof.
+
+Memory used by each bot is estimated by sampling of memory allocations: memory allocation functions are replaced with
+wrappers, which forward calls to glibc or to an allocator loaded with `LD_PRELOAD`, count total size of live allocations
+exactly and remember a random subset of allocations together with the bot, which made them. Use
+`--memory-sampling-interval` to change the mean number of kilobytes between samples or `--memory-sampling-interval=0`
+to disable the sampling. Build with `-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF` to keep the original allocation functions.
+The accounting is supported only on Linux with dynamically linked glibc. `--tdlib-restart-bot-memory-limit` restarts
+TDLib instances of bots, which use more memory than specified.
 
 Numbers of objects in memory require a small patch of TDLib from [td-patches](td-patches/README.md), which is applied
 automatically by CMake, so `git` is needed to build the server.

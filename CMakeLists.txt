@@ -105,6 +105,7 @@ set(TELEGRAM_BOT_API_SOURCE
   telegram-bot-api/Client.cpp
   telegram-bot-api/ClientManager.cpp
   telegram-bot-api/CpuSampler.cpp
+  telegram-bot-api/HeapSampler.cpp
   telegram-bot-api/HttpConnection.cpp
   telegram-bot-api/HttpStatConnection.cpp
   telegram-bot-api/Query.cpp
@@ -117,6 +118,7 @@ set(TELEGRAM_BOT_API_SOURCE
   telegram-bot-api/ClientManager.h
   telegram-bot-api/ClientParameters.h
   telegram-bot-api/CpuSampler.h
+  telegram-bot-api/HeapSampler.h
   telegram-bot-api/HttpConnection.h
   telegram-bot-api/HttpServer.h
   telegram-bot-api/HttpStatConnection.h
@@ -138,11 +140,27 @@ if (CMAKE_SYSTEM_NAME MATCHES "Linux")
   endif()
 endif()
 
+# accounting of memory usage of each bot replaces memory allocation functions; it requires dynamic linking with glibc
+option(TELEGRAM_BOT_API_HEAP_SAMPLING "Account memory usage of each bot by replacing memory allocation functions" ON)
+set(TELEGRAM_BOT_API_HEAP_SAMPLING_ENABLED OFF)
+if (TELEGRAM_BOT_API_HEAP_SAMPLING AND CMAKE_SYSTEM_NAME MATCHES "Linux" AND NOT MEMPROF AND
+    NOT "${CMAKE_EXE_LINKER_FLAGS} ${CMAKE_CXX_FLAGS}" MATCHES "(^| )-static( |$)")
+  set(TELEGRAM_BOT_API_HEAP_SAMPLING_ENABLED ON)
+  target_compile_definitions(telegram-bot-api PRIVATE TELEGRAM_BOT_API_HEAP_SAMPLING)
+  target_link_libraries(telegram-bot-api PRIVATE ${CMAKE_DL_LIBS})
+endif()
+
 # test-only tools for test/restart/restart_test.py
 add_executable(restart-test-fake-auth EXCLUDE_FROM_ALL test/restart/fake_auth.cpp)
 target_link_libraries(restart-test-fake-auth PRIVATE tdmtproto tddb tdutils)
 add_executable(restart-test-fake-updates EXCLUDE_FROM_ALL test/restart/fake_updates.cpp)
 target_link_libraries(restart-test-fake-updates PRIVATE tddb tdutils)
+
+# verification of memory accounting: test/heap/heap_sampler_test.cpp
+add_executable(heap-sampler-test EXCLUDE_FROM_ALL test/heap/heap_sampler_test.cpp telegram-bot-api/HeapSampler.cpp)
+target_include_directories(heap-sampler-test PRIVATE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
+target_compile_definitions(heap-sampler-test PRIVATE TELEGRAM_BOT_API_HEAP_SAMPLING)
+target_link_libraries(heap-sampler-test PRIVATE tdactor tdutils ${CMAKE_DL_LIBS})
 
 install(TARGETS telegram-bot-api RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 if (MSVC AND VCPKG_TOOLCHAIN)

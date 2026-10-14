@@ -4,6 +4,8 @@
 //
 #include "telegram-bot-api/BotMetrics.h"
 
+#include "telegram-bot-api/HeapSampler.h"
+
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
 #include "td/utils/SliceBuilder.h"
@@ -121,19 +123,51 @@ td::FlatHashMap<td::uint64, CpuContextInfo> &get_cpu_contexts() {
 }
 }  // namespace
 
-void BotMetrics::register_cpu_context(td::uint64 context, CpuPart part, const void *owner) {
+static_assert(static_cast<int>(BotMetrics::MemoryPart::Size) == HeapSampler::PART_COUNT, "");
+static_assert(static_cast<int>(BotMetrics::CpuPart::Client) == static_cast<int>(BotMetrics::MemoryPart::Client), "");
+static_assert(static_cast<int>(BotMetrics::CpuPart::Tdlib) == static_cast<int>(BotMetrics::MemoryPart::Tdlib), "");
+
+BotMetrics::BotMetrics() : heap_owner_(HeapSampler::create_owner()) {
+}
+
+BotMetrics::~BotMetrics() {
+  HeapSampler::destroy_owner(heap_owner_);
+}
+
+void BotMetrics::register_context(td::uint64 context, CpuPart part, const void *owner) {
   CHECK(context != 0);
   CHECK(owner != nullptr);
   // memory of a destroyed context can be reused for a new context, so the last registration wins
   get_cpu_contexts()[context] = CpuContextInfo{this, part, owner};
+  HeapSampler::set_context_owner(context, heap_owner_, static_cast<td::int32>(part));
 }
 
-void BotMetrics::unregister_cpu_context(td::uint64 context, const void *owner) {
+void BotMetrics::unregister_context(td::uint64 context, const void *owner) {
   auto &cpu_contexts = get_cpu_contexts();
   auto it = cpu_contexts.find(context);
   if (it != cpu_contexts.end() && it->second.owner == owner) {
+    HeapSampler::remove_context(context, it->second.metrics->heap_owner_);
     cpu_contexts.erase(it);
   }
+}
+
+BotMetrics::MemoryStats BotMetrics::get_memory_stats() const {
+  MemoryStats result;
+  if (heap_owner_ == 0 || HeapSampler::get_sampling_interval() <= 0) {
+    return result;
+  }
+  auto stats = HeapSampler::get_owner_stats(heap_owner_);
+  for (std::size_t part = 0; part < static_cast<std::size_t>(MemoryPart::Size); part++) {
+    result.bytes[part] = stats.bytes[part];
+  }
+  result.sample_count = stats.sample_count;
+  return result;
+}
+
+td::int64 BotMetrics::get_restartable_memory() const {
+  auto stats = get_memory_stats();
+  return stats.bytes[static_cast<std::size_t>(MemoryPart::Client)] +
+         stats.bytes[static_cast<std::size_t>(MemoryPart::Tdlib)];
 }
 
 bool BotMetrics::add_cpu_samples(td::uint64 context, td::uint64 count) {
@@ -242,6 +276,19 @@ td::Slice BotMetrics::get_cpu_part_name(CpuPart part) {
       return td::Slice("client");
     case CpuPart::Tdlib:
       return td::Slice("tdlib");
+    default:
+      return td::Slice("unknown");
+  }
+}
+
+td::Slice BotMetrics::get_memory_part_name(MemoryPart part) {
+  switch (part) {
+    case MemoryPart::Client:
+      return td::Slice("client");
+    case MemoryPart::Tdlib:
+      return td::Slice("tdlib");
+    case MemoryPart::Updates:
+      return td::Slice("updates");
     default:
       return td::Slice("unknown");
   }

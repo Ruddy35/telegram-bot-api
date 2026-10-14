@@ -42,8 +42,8 @@ scrape_configs:
   невалидными токенами собираются в общие счётчики, чтобы мусорные токены не плодили ряды.
 
 Все счётчики инкрементируются в одном потоке без блокировок. Это несколько десятков наносекунд на
-запрос при стоимости самого запроса в десятки и сотни микросекунд. Значения памяти и диска
-считаются только в момент опроса или раз в минуту.
+запрос при стоимости самого запроса в десятки и сотни микросекунд. Значения диска и объектов TDLib
+считаются только в момент опроса или раз в минуту; память по ботам ведётся непрерывно.
 
 ## Метрики бота
 
@@ -173,6 +173,53 @@ scrape_configs:
 стоит. Запросы разных ботов распределены по минуте. Для этого TDLib пропатчен (`td-patches/`,
 применяется автоматически при сборке).
 
+### Память
+
+| Метрика | Метки | Что это |
+|---|---|---|
+| `tgbotapi_bot_memory_bytes` | `part` | Оперативная память бота в байтах. `client` — часть Bot API: кэш сообщений, пользователей и чатов, запросы в обработке, вебхук. `tdlib` — TDLib-инстанс бота. `updates` — очередь апдейтов, которые бот ещё не забрал |
+| `tgbotapi_bot_memory_samples` | | Сколько выделений памяти бота попало в выборку. Относительная погрешность `tgbotapi_bot_memory_bytes` — около `1 / sqrt(значение)` |
+
+Сервер перехватывает все функции выделения памяти (`malloc`, `free`, `realloc` и остальные) и
+передаёт их дальше настоящему аллокатору: glibc или подключённому через `LD_PRELOAD`, например
+jemalloc. По пути он делает две вещи:
+
+1. **Точно** считает общий объём живых выделений: `tgbotapi_heap_bytes`.
+2. **Выборочно** учитывает выделения по ботам. В среднем раз на 64 КБ выделенной памяти
+   (`--memory-sampling-interval`) одно выделение запоминается вместе с ботом, в контексте которого
+   оно сделано, и «весом» — сколько памяти оно представляет. Блок размером n попадает в выборку с
+   вероятностью `1 - exp(-(n + 1) / 64 КБ)`, а его вес — размер, делённый на эту вероятность.
+   Поэтому крупные блоки учитываются почти всегда и точно, а мелкие — статистически. Оценка
+   несмещённая: сумма весов живых отобранных блоков в среднем равна настоящему объёму.
+
+Память принадлежит тому боту, в контексте которого её выделили, и остаётся за ним, пока её не
+освободят, кто бы это ни сделал. Новые апдейты в очередь записываются в часть `updates`: рестарт
+инстанса их не освобождает, поэтому лимиты рестартов учитывают только `client` и `tdlib`.
+
+Точность при шаге 64 КБ — наибольшая ошибка в тестах при постоянном выделении и освобождении
+памяти в 4 потоках:
+
+| Память бота | Наибольшая ошибка |
+|---|---|
+| 2 ГБ | 2% |
+| 500 МБ | 3,5% |
+| 100 МБ | 8% |
+| 20 МБ | 15% |
+
+Проверено тестом `test/heap/heap_sampler_test.cpp` на glibc и jemalloc:
+- на 200 независимых кучах для каждого из 5 распределений размеров среднее отклонение не
+  выходит за статистическую погрешность, то есть оценка несмещённая;
+- точный счётчик совпадает со статистикой самого аллокатора до байта;
+- после освобождения всей памяти оценки возвращаются ровно в 0, без дрейфа на 20 млн операций;
+- многопоточный стресс всех функций выделения памяти проходит без единого повреждения данных.
+
+Самопроверка в работе: `tgbotapi_heap_estimated_bytes` должен быть близок к `tgbotapi_heap_bytes`.
+
+Цена: около 4 нс на пару `malloc`+`free` (сам `malloc` стоит ~20 нс) и ~1 МБ памяти. На сервере
+под нагрузкой разница в CPU на запрос не видна на фоне шума. Учёт работает только с динамически
+слинкованной glibc в Linux; собрать без него: `-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF`, выключить без
+пересборки: `--memory-sampling-interval=0` (тогда остаётся только точный общий счётчик).
+
 ### CPU
 
 | Метрика | Метки | Что это |
@@ -202,6 +249,10 @@ scrape_configs:
 | Метрика | Что это |
 |---|---|
 | `tgbotapi_process_resident_memory_bytes`, `tgbotapi_process_virtual_memory_bytes` | Память процесса |
+| `tgbotapi_heap_bytes` | Точный объём всех живых выделений памяти. Разница с `tgbotapi_process_resident_memory_bytes` — память, которую аллокатор освободил, но ещё не вернул ОС, а также стеки потоков и код |
+| `tgbotapi_heap_estimated_bytes` | Сумма оценок по ботам и неатрибутированной памяти; должна быть близка к `tgbotapi_heap_bytes` |
+| `tgbotapi_memory_unattributed_bytes` | Память, не относящаяся ни к одному авторизованному боту: HTTP-соединения, загружаемые файлы, общие структуры |
+| `tgbotapi_memory_samples`, `tgbotapi_memory_sampling_interval_bytes`, `tgbotapi_memory_sampler_overhead_bytes` | Число отобранных выделений, шаг выборки и память самого учёта |
 | `tgbotapi_process_cpu_seconds_total{mode="user"\|"system"}` | CPU процесса |
 | `tgbotapi_thread_cpu_seconds_total{scheduler}` | Точное CPU-время каждого потока сервера, см. ниже |
 | `tgbotapi_process_disk_read_bytes_total`, `tgbotapi_process_disk_written_bytes_total` | Чтение с диска и запись на диск всем процессом |
@@ -264,6 +315,14 @@ sum by (bot) (rate(tgbotapi_bot_cpu_seconds_total[5m]))
 # загрузка потока всех TDLib-инстансов
 rate(tgbotapi_thread_cpu_seconds_total{scheduler="0"}[1m])
 
+# топ-10 ботов по памяти и из чего она состоит
+topk(10, sum by (bot) (tgbotapi_bot_memory_bytes))
+sum by (bot, part) (tgbotapi_bot_memory_bytes{bot="123"})
+
+# память, которую аллокатор держит свободной (фрагментация), и проверка учёта
+tgbotapi_process_resident_memory_bytes - tgbotapi_heap_bytes
+tgbotapi_heap_estimated_bytes / tgbotapi_heap_bytes
+
 # кто копит объекты в памяти TDLib
 topk(10, sum by (bot) (tgbotapi_bot_tdlib_objects{type="file_node"}))
 topk(10, sum by (bot) (tgbotapi_bot_tdlib_objects{type="chat"}))
@@ -271,7 +330,7 @@ topk(10, sum by (bot) (tgbotapi_bot_tdlib_objects{type="chat"}))
 
 Индекс нагрузки удобно считать recording rule'ом в VictoriaMetrics, а не в сервере: тогда веса можно
 менять без переразвёртывания. Пример — взвешенная сумма долей бота в CPU, запросах, трафике и
-объектах в памяти TDLib за сутки:
+памяти за сутки:
 
 ```
 0.4 * (sum by (bot) (increase(tgbotapi_bot_cpu_seconds_total[1d]))
@@ -280,15 +339,15 @@ topk(10, sum by (bot) (tgbotapi_bot_tdlib_objects{type="chat"}))
        / ignoring(bot) group_left sum(increase(tgbotapi_bot_requests_total[1d])))
 + 0.2 * (sum by (bot) (increase(tgbotapi_bot_request_bytes_total[1d]) + increase(tgbotapi_bot_response_bytes_total[1d]))
        / ignoring(bot) group_left sum(increase(tgbotapi_bot_request_bytes_total[1d]) + increase(tgbotapi_bot_response_bytes_total[1d])))
-+ 0.2 * (sum by (bot) (max_over_time(tgbotapi_bot_tdlib_objects{type="file_node"}[1d]))
-       / ignoring(bot) group_left sum(max_over_time(tgbotapi_bot_tdlib_objects{type="file_node"}[1d])))
++ 0.2 * (sum by (bot) (max_over_time(tgbotapi_bot_memory_bytes[1d]))
+       / ignoring(bot) group_left sum(max_over_time(tgbotapi_bot_memory_bytes[1d])))
 ```
 
 ## Ограничения
 
-- **Память в байтах по боту** не считается: все боты делят один аллокатор. Вместо этого есть
-  число объектов каждого типа (`tgbotapi_bot_tdlib_objects`) и объектов в кэше Bot API
-  (`tgbotapi_bot_cached_objects`). Их рост и показывает, кто занимает память.
+- **Память по боту** — статистическая оценка с погрешностью из таблицы выше. Свободная память,
+  которую аллокатор не вернул ОС, не принадлежит никому и видна только по разнице
+  `tgbotapi_process_resident_memory_bytes - tgbotapi_heap_bytes`.
 - **Дисковый ввод-вывод по боту** не считается: базы всех ботов пишет общий поток, а запись
   идёт через общий page cache. Есть ввод-вывод по процессу и по потокам, а по боту его косвенно
   показывают скачивания и загрузки файлов, `tgbotapi_bot_storage_bytes` и CPU части `tdlib`.

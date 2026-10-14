@@ -41,6 +41,16 @@ class BotMetrics {
 
   enum class CpuPart : td::int8 { Client, Tdlib, Size };
 
+  // memory is accounted by HeapSampler; Updates is memory of the update queue, which isn't freed by restarts
+  enum class MemoryPart : td::int8 { Client, Tdlib, Updates, Size };
+
+  BotMetrics();
+  BotMetrics(const BotMetrics &) = delete;
+  BotMetrics &operator=(const BotMetrics &) = delete;
+  BotMetrics(BotMetrics &&) = delete;
+  BotMetrics &operator=(BotMetrics &&) = delete;
+  ~BotMetrics();
+
   static constexpr std::size_t MAX_UPDATE_TYPES = 64;
   static constexpr std::size_t DURATION_BUCKET_COUNT = 13;
   static constexpr double DURATION_BUCKETS[DURATION_BUCKET_COUNT] = {0.005, 0.01, 0.025, 0.05, 0.1,  0.25, 0.5,
@@ -71,11 +81,11 @@ class BotMetrics {
 
   void set_tdlib_object_counts(td::vector<std::pair<td::string, td::int64>> object_counts);
 
-  // registers an actor context, CPU time of which is consumed by the bot; the context must be unregistered
+  // registers an actor context, CPU time and memory of which are consumed by the bot; the context must be unregistered
   // by the same owner before the BotMetrics object is destroyed
-  void register_cpu_context(td::uint64 context, CpuPart part, const void *owner);
+  void register_context(td::uint64 context, CpuPart part, const void *owner);
 
-  static void unregister_cpu_context(td::uint64 context, const void *owner);
+  static void unregister_context(td::uint64 context, const void *owner);
 
   // returns false if the context isn't registered
   static bool add_cpu_samples(td::uint64 context, td::uint64 count);
@@ -111,6 +121,18 @@ class BotMetrics {
 
   static td::Slice get_cpu_part_name(CpuPart part);
 
+  static td::Slice get_memory_part_name(MemoryPart part);
+
+  // estimated memory used by the bot; zeros if memory accounting is disabled
+  struct MemoryStats {
+    td::int64 bytes[static_cast<std::size_t>(MemoryPart::Size)] = {};
+    td::int64 sample_count = 0;
+  };
+  MemoryStats get_memory_stats() const;
+
+  // memory, which can be released by a restart of the TDLib instance
+  td::int64 get_restartable_memory() const;
+
   td::FlatHashMap<td::uint64, td::int64> requests_;
   td::FlatHashMap<td::int32, MethodTotals> method_totals_;  // method_id + 1 -> totals
   std::array<td::int64, DURATION_BUCKET_COUNT + 1> duration_buckets_{};
@@ -136,6 +158,8 @@ class BotMetrics {
   td::int64 tdlib_updates_ = 0;
 
   std::array<td::int64, static_cast<std::size_t>(CpuPart::Size)> cpu_samples_{};
+
+  td::int32 heap_owner_ = 0;  // owner in HeapSampler or 0
 
   bool has_storage_statistics_ = false;
   td::int64 storage_files_size_ = 0;

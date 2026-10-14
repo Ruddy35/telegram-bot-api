@@ -7,6 +7,7 @@
 #include "telegram-bot-api/ClientManager.h"
 
 #include "telegram-bot-api/ClientParameters.h"
+#include "telegram-bot-api/HeapSampler.h"
 #include "telegram-bot-api/WebhookActor.h"
 
 #include "td/telegram/ClientActor.h"
@@ -311,8 +312,10 @@ void ClientManager::check_restarts(double now) {
   if (now < next_restart_time_) {
     return;
   }
+  bool has_bot_memory_limit =
+      parameters_->tdlib_restart_bot_memory_limit_ > 0 && parameters_->memory_sampling_interval_ > 0;
   if (parameters_->tdlib_restart_interval_ <= 0.0 && parameters_->tdlib_restart_memory_limit_ <= 0 &&
-      !has_restart_requests_) {
+      !has_bot_memory_limit && !has_restart_requests_) {
     return;
   }
   has_restart_requests_ = false;
@@ -347,31 +350,51 @@ void ClientManager::check_restarts(double now) {
     return start_restart(requested_client_id, "request");
   }
 
+  // the TDLib instance, which can release the most memory; its size is estimated by memory accounting if it is enabled,
+  // or by the number of updates received from TDLib otherwise
+  auto find_heaviest_client = [&](td::int64 min_memory) {
+    td::uint64 heaviest_client_id = 0;
+    td::int64 max_weight = -1;
+    for (auto id : client_ids) {
+      auto *client_info = clients_.get(id);
+      CHECK(client_info != nullptr);
+      if (now < client_info->start_time_ + parameters_->tdlib_restart_min_uptime_ ||
+          now < client_info->restart_retry_time_ || !can_restart(client_info)) {
+        continue;
+      }
+      td::int64 weight = parameters_->memory_sampling_interval_ > 0
+                             ? client_info->metrics_->get_restartable_memory()
+                             : client_info->client_.get_actor_unsafe()->get_tdlib_update_count();
+      if (weight >= min_memory && weight > max_weight) {
+        max_weight = weight;
+        heaviest_client_id = id;
+      }
+    }
+    return std::make_pair(heaviest_client_id, max_weight);
+  };
+
   auto memory_limit = parameters_->tdlib_restart_memory_limit_;
-  if (memory_limit > 0 && now >= next_memory_check_time_) {
+  if ((memory_limit > 0 || has_bot_memory_limit) && now >= next_memory_check_time_) {
     next_memory_check_time_ = now + RESTART_MEMORY_CHECK_PERIOD;
-    auto r_mem_stat = td::mem_stat();
-    if (r_mem_stat.is_ok() && r_mem_stat.ok().resident_size_ > static_cast<td::uint64>(memory_limit)) {
-      // restart the TDLib instance, which has received the biggest number of updates and is likely to be the biggest
-      td::uint64 heaviest_client_id = 0;
-      td::int64 max_update_count = -1;
-      for (auto id : client_ids) {
-        auto *client_info = clients_.get(id);
-        CHECK(client_info != nullptr);
-        if (now < client_info->start_time_ + parameters_->tdlib_restart_min_uptime_ ||
-            now < client_info->restart_retry_time_ || !can_restart(client_info)) {
-          continue;
-        }
-        auto update_count = client_info->client_.get_actor_unsafe()->get_tdlib_update_count();
-        if (update_count > max_update_count) {
-          max_update_count = update_count;
-          heaviest_client_id = id;
+    if (memory_limit > 0) {
+      auto r_mem_stat = td::mem_stat();
+      if (r_mem_stat.is_ok() && r_mem_stat.ok().resident_size_ > static_cast<td::uint64>(memory_limit)) {
+        auto heaviest_client = find_heaviest_client(0);
+        if (heaviest_client.first != 0) {
+          LOG(WARNING) << "Memory usage " << td::format::as_size(r_mem_stat.ok().resident_size_)
+                       << " exceeds the limit " << td::format::as_size(static_cast<td::uint64>(memory_limit));
+          return start_restart(heaviest_client.first, "memory limit");
         }
       }
-      if (heaviest_client_id != 0) {
-        LOG(WARNING) << "Memory usage " << td::format::as_size(r_mem_stat.ok().resident_size_) << " exceeds the limit "
-                     << td::format::as_size(static_cast<td::uint64>(memory_limit));
-        return start_restart(heaviest_client_id, "memory limit");
+    }
+    if (has_bot_memory_limit) {
+      auto heaviest_client = find_heaviest_client(parameters_->tdlib_restart_bot_memory_limit_ + 1);
+      if (heaviest_client.first != 0) {
+        LOG(WARNING) << "Bot " << clients_.get(heaviest_client.first)->tqueue_id_ << " uses "
+                     << td::format::as_size(static_cast<td::uint64>(heaviest_client.second))
+                     << " of memory, which exceeds the limit "
+                     << td::format::as_size(static_cast<td::uint64>(parameters_->tdlib_restart_bot_memory_limit_));
+        return start_restart(heaviest_client.first, "bot memory limit");
       }
     }
   }
@@ -680,6 +703,21 @@ void ClientManager::add_bot_metrics(MetricsWriter &writer, const ClientInfo &cli
   // TDLib instance
   writer.add("tgbotapi_bot_tdlib_updates_total", counter, "Number of updates received from TDLib", bot_label,
              metrics.tdlib_updates_);
+  if (parameters_->memory_sampling_interval_ > 0) {
+    auto memory = metrics.get_memory_stats();
+    for (std::size_t part = 0; part < static_cast<std::size_t>(BotMetrics::MemoryPart::Size); part++) {
+      writer.add("tgbotapi_bot_memory_bytes", gauge,
+                 "Estimated size of memory used by the bot: client for the Bot API part, tdlib for the TDLib instance, "
+                 "updates for pending updates",
+                 PSLICE() << bot_label << ",part=\""
+                          << BotMetrics::get_memory_part_name(static_cast<BotMetrics::MemoryPart>(part)) << '"',
+                 memory.bytes[part]);
+    }
+    writer.add("tgbotapi_bot_memory_samples", gauge,
+               "Number of live sampled memory allocations of the bot; relative error of tgbotapi_bot_memory_bytes is "
+               "about 1 / sqrt(value)",
+               bot_label, memory.sample_count);
+  }
   if (cpu_sampling_period_ > 0.0) {
     for (std::size_t part = 0; part < static_cast<std::size_t>(BotMetrics::CpuPart::Size); part++) {
       writer.add("tgbotapi_bot_cpu_seconds_total", counter,
@@ -791,6 +829,36 @@ void ClientManager::get_metrics(td::Promise<td::BufferSlice> promise,
                  static_cast<double>(cpu_stat.process_system_ticks_) / static_cast<double>(ticks_per_second));
     }
 #endif
+    if (parameters_->memory_sampling_interval_ > 0) {
+      auto heap_stats = HeapSampler::get_stats();
+      // memory of bots, for which there are no metrics, is unattributed
+      td::int64 authorized_bot_memory = 0;
+      for (auto id : clients_.ids()) {
+        auto *client_info = clients_.get(id);
+        CHECK(client_info != nullptr);
+        if (client_info->was_authorized_) {
+          auto memory = client_info->metrics_->get_memory_stats();
+          for (auto bytes : memory.bytes) {
+            authorized_bot_memory += bytes;
+          }
+        }
+      }
+      writer.add("tgbotapi_heap_bytes", gauge, "Exact size of all live memory allocations of the process", td::Slice(),
+                 heap_stats.live_bytes);
+      writer.add("tgbotapi_heap_estimated_bytes", gauge,
+                 "Estimated size of all live memory allocations, which must be close to tgbotapi_heap_bytes",
+                 td::Slice(), heap_stats.estimated_live_bytes);
+      writer.add("tgbotapi_memory_unattributed_bytes", gauge,
+                 "Estimated size of memory used outside of authorized bots, for example, by HTTP connections",
+                 td::Slice(), heap_stats.estimated_live_bytes - authorized_bot_memory);
+      writer.add("tgbotapi_memory_sampling_interval_bytes", gauge,
+                 "Mean size of allocated memory between samples used to estimate memory used by bots", td::Slice(),
+                 HeapSampler::get_sampling_interval());
+      writer.add("tgbotapi_memory_samples", gauge, "Number of live sampled memory allocations", td::Slice(),
+                 heap_stats.sample_count);
+      writer.add("tgbotapi_memory_sampler_overhead_bytes", gauge, "Memory used by the memory accounting itself",
+                 td::Slice(), heap_stats.sampler_overhead_bytes);
+    }
     if (cpu_sampling_period_ > 0.0) {
       writer.add("tgbotapi_cpu_sampling_period_seconds", gauge,
                  "CPU time of a thread between two samples used to estimate CPU time consumed by bots", td::Slice(),
