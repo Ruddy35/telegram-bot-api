@@ -15,7 +15,8 @@ The patch only reads sizes of containers and maintains a counter of loaded messa
 CMake applies every `*.patch` in the order of names with `git apply` during configuration. An already applied patch
 is skipped, so CMake can be run again. If a patch can't be applied, the configuration fails.
 
-After that `git status` shows the submodule `td` as modified, which is expected.
+The applied patches change files inside the submodule `td`; `.gitmodules` sets `ignore = dirty` for it, so `git status`
+doesn't show the submodule as modified because of them. Changes of the commit of the submodule are still shown.
 
 `git` is needed. The patches are applied with a separate empty git directory in the build directory, so they are
 applied in the same way whether `td` is a submodule, a plain directory or a copy without the parent `.git`, for
