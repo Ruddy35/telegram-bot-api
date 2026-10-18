@@ -36,12 +36,21 @@ class DocsTest(unittest.TestCase):
     def test_documented_options_exist(self):
         # options of the server and of the verification tools, and words used in instructions for git and cmake
         options = set(re.findall(r'"([a-z][a-z0-9-]+)"', read(os.path.join('telegram-bot-api', 'telegram-bot-api.cpp'))))
-        for tool in ['latency_ab.py', 'verify_memory_accuracy.py']:
-            options |= set(re.findall(r"'--([a-z][a-z0-9-]+)'", read(os.path.join('test', 'verify', tool))))
+        for tool in ['verify/latency_ab.py', 'verify/verify_memory_accuracy.py', 'test_docker.py']:
+            options |= set(re.findall(r"'--([a-z][a-z0-9-]+)'", read(os.path.join('test', tool))))
         options |= {'recursive', 'build', 'target', 'git'}  # 'diff --git' is a header of patches
+        options |= {'name', 'stop-timeout', 'build-arg'}  # options of docker
         for doc in DOCS:
             for option in re.findall(r'(?<![\w-])--([a-z][a-z0-9-]+)', read(doc)):
                 self.assertIn(option, options, '%s mentions unknown option --%s' % (doc, option))
+
+    def test_documented_variables_exist(self):
+        # docker/entrypoint.sh converts TELEGRAM_<NAME> to --<name> except for variables read by the server itself
+        options = set(re.findall(r'"([a-z][a-z0-9-]+)"', read(os.path.join('telegram-bot-api', 'telegram-bot-api.cpp'))))
+        for doc in DOCS + ['Dockerfile']:
+            for name in re.findall(r'\bTELEGRAM_([A-Z0-9_]+)', read(doc)):
+                if name not in ('API_ID', 'API_HASH') and not name.startswith('BOT_API_'):
+                    self.assertIn(name.lower().replace('_', '-'), options, '%s mentions unknown TELEGRAM_%s' % (doc, name))
 
 
 if __name__ == '__main__':

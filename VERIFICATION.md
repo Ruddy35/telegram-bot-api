@@ -15,7 +15,8 @@ test/run_all.sh <build dir>   # all tests below except the long experiments; pri
 | The memory estimate of a bot is unbiased and its reported standard deviation σ is right | A proof below; 1000 independent model heaps; 200 independent real servers | `heap-sampler-test bias`, `verify_memory_accuracy.py offline` | Mean z within ±0.15 and coverage of 2σ 94.5-98% on model heaps; 93.8-95.2% on real servers |
 | Memory accounting doesn't break allocations | Concurrent stress of all allocation functions with pattern checks; all results and errors of each function | `heap-sampler-test stress api edge limits` | 0 errors with glibc and jemalloc, in the normal and audit modes |
 | Memory accounting doesn't add latency or stalls | Concurrent A/B test of the server with and without memory accounting | `latency_ab.py` | No failures of 1080120 requests; an increase of p50, p99 and p99.9 latency is rejected; +0.9% CPU time per request |
-| Documentation describes the code | All declared metrics are documented; all documented options exist | `test/test_docs.py` | Pass |
+| The Docker image passes options from environment variables and works | The entrypoint with a fake server; the real server started by the entrypoint; a container of the image | `test/test_docker.py` | Pass |
+| Documentation describes the code | All declared metrics are documented; all documented options and environment variables exist | `test/test_docs.py` | Pass |
 
 ## Graceful restarts
 
@@ -244,6 +245,21 @@ servers and are caused by the virtual machine.
 On a running server the same is visible all the time: `tgbotapi_memory_sampler_operation_seconds`,
 `tgbotapi_memory_sampler_max_lock_wait_seconds`, `tgbotapi_scheduler_lag_seconds` and
 `tgbotapi_bot_request_duration_seconds`.
+
+## Docker image
+
+```
+docker build -t telegram-bot-api .
+python3 test/test_docker.py <build dir> --image telegram-bot-api
+```
+
+The test checks that `docker/entrypoint.sh` converts every `TELEGRAM_<NAME>` variable by the rules of the README
+(values with spaces and `=`, options without a value, omitted options, arguments of the container after the options)
+and doesn't put the API hash into the command line; that the real server started by the entrypoint uses the options
+from the environment, exits with the code 0 on `SIGTERM` and rejects an invalid option; and with `--image` that a
+container of the image answers an API request of a test bot from the mounted volume, exports memory metrics, which
+need dynamically linked glibc, runs as the user `telegram-bot-api` and exits with the code 0 on `docker stop`.
+`test/run_all.sh` runs the test without `--image`, because building of the image takes a long time.
 
 ## Metrics
 

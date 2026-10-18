@@ -38,4 +38,7 @@ python3 test/test_docs.py
 echo "=== server"
 python3 test/restart/restart_test.py "$build"
 
+echo "=== entrypoint of the Docker image; test the image itself with: test/test_docker.py <build dir> --image <image>"
+python3 test/test_docker.py "$build"
+
 echo "ALL TESTS PASSED"

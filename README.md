@@ -129,6 +129,58 @@ Memory accounting replaces memory allocation functions and works only on Linux w
 objects in memory of TDLib instances require a small patch of TDLib from [td-patches](td-patches/README.md), which is
 applied by CMake automatically, so `git` is needed for the build.
 
+### Docker
+
+The image is configured by environment variables: `TELEGRAM_<NAME>=<value>` becomes the option `--<name>=<value>`,
+where `<name>` is in lower case with `-` instead of `_`; the value `true` passes an option without a value, such as
+`--local`, and `false` or an empty value omits the option. `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are required; the
+server reads them itself, so the API hash doesn't appear in the command line. Arguments after the image name are passed
+after these options and override them.
+
+```
+git clone --recursive https://github.com/Ruddy35/telegram-bot-api.git
+cd telegram-bot-api
+docker build -t telegram-bot-api .
+docker run -d --name telegram-bot-api --stop-timeout 60 \
+  -e TELEGRAM_API_ID=<api_id> -e TELEGRAM_API_HASH=<api_hash> -e TELEGRAM_LOCAL=true \
+  -e TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT=5500 -e TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT=1500 \
+  -p 8081:8081 -p 127.0.0.1:8082:8082 -v telegram-bot-api:/var/lib/telegram-bot-api telegram-bot-api
+```
+
+The same with Docker Compose:
+
+```yaml
+services:
+  telegram-bot-api:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      TELEGRAM_API_ID: <api_id>
+      TELEGRAM_API_HASH: <api_hash>
+      TELEGRAM_LOCAL: "true"
+      TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT: 5500
+      TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT: 1500
+    ports:
+      - "8081:8081"
+      - "127.0.0.1:8082:8082"
+    volumes:
+      - telegram-bot-api:/var/lib/telegram-bot-api
+volumes:
+  telegram-bot-api:
+```
+
+* The image sets `TELEGRAM_DIR=/var/lib/telegram-bot-api`, `TELEGRAM_TEMP_DIR=/tmp/telegram-bot-api`,
+  `TELEGRAM_HTTP_PORT=8081` and `TELEGRAM_HTTP_STAT_PORT=8082`. Data of bots is kept in the volume.
+* The port 8082 serves statistics and `/metrics` and allows to restart TDLib instances and to change the verbosity
+  level, so publish it only to the internal network, for example, as `127.0.0.1:8082:8082`.
+* The server runs as the user `telegram-bot-api`, so a mounted host directory must be writable by it.
+* The server needs time to close TDLib instances on stop, hence `--stop-timeout 60` and `stop_grace_period: 60s`.
+* The log is written to the standard error stream, which `docker logs` shows. By default it contains only errors;
+  `TELEGRAM_VERBOSITY=2` adds warnings, including messages about restarts of TDLib instances.
+* Building of TDLib takes a long time and needs up to 3 GB of memory per compilation job; `--build-arg BUILD_JOBS=2`
+  decreases the number of jobs from 4.
+
 <a name="license"></a>
 ## License
 `Telegram Bot API server` source code is licensed under the terms of the Boost Software License. See [LICENSE_1_0.txt](http://www.boost.org/LICENSE_1_0.txt) for more information.
