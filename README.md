@@ -178,8 +178,8 @@ volumes:
 * The server needs time to close TDLib instances on stop, hence `--stop-timeout 60` and `stop_grace_period: 60s`.
 * The log is written to the standard error stream, which `docker logs` shows. By default it contains only errors;
   `TELEGRAM_VERBOSITY=2` adds warnings, including messages about restarts of TDLib instances.
-* Building of TDLib takes a long time and needs up to 3 GB of memory per compilation job; `--build-arg BUILD_JOBS=2`
-  decreases the number of jobs from 4.
+* Building of the image takes about 20 minutes on 4 cores and needs up to 3 GB of memory per compilation job;
+  `--build-arg BUILD_JOBS=2` decreases the number of jobs from 4.
 
 <a name="license"></a>
 ## License
