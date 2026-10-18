@@ -55,7 +55,7 @@ def test_entrypoint(work):
 
     env = {
         'TELEGRAM_HTTP_PORT': '8081',
-        'TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT': '1500',
+        'TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT_MIB': '1500',
         'TELEGRAM_LOCAL': 'true',
         'TELEGRAM_MALLOC_TRIM': 'false',
         'TELEGRAM_PROXY': '',
@@ -69,7 +69,7 @@ def test_entrypoint(work):
     assert process.wait(30) == 0
     with open(output) as f:
         arguments = f.read().split('\0')[:-1]
-    expected_options = {'--http-port=8081', '--tdlib-restart-bot-memory-limit=1500', '--local', '--filter=a b=c'}
+    expected_options = {'--http-port=8081', '--tdlib-restart-bot-memory-limit-mib=1500', '--local', '--filter=a b=c'}
     assert set(arguments[:-2]) == expected_options and len(arguments) == len(expected_options) + 2, arguments
     assert arguments[-2:] == ['--verbosity=3', 'an argument'], arguments
     with open(output + '.hash') as f:
@@ -82,7 +82,7 @@ def check_running_server(api_port, stat_port, token=None):
     values = testlib.wait_for(lambda: try_metrics(stat_port), 30, 'the server')
     names = {name for name, _ in values}
     assert 'tgbotapi_heap_bytes' in names, 'memory accounting must work'
-    assert not [name for name in names if name.startswith('tgbotapi_cpu_')], 'TELEGRAM_CPU_SAMPLING_RATE=0 is ignored'
+    assert not [name for name in names if name.startswith('tgbotapi_cpu_')], 'TELEGRAM_CPU_SAMPLING_RATE_HZ=0 is ignored'
     if token is not None:
         result, _ = testlib.http_request(api_port, token, 'getMe', {})
         assert result.get('ok'), result
@@ -105,8 +105,8 @@ def server_env(work, api_port, stat_port):
         'TELEGRAM_DIR': work,
         'TELEGRAM_HTTP_PORT': str(api_port),
         'TELEGRAM_HTTP_STAT_PORT': str(stat_port),
-        'TELEGRAM_CPU_SAMPLING_RATE': '0',
-        'TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT': '100000',
+        'TELEGRAM_CPU_SAMPLING_RATE_HZ': '0',
+        'TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT_MIB': '100000',
     }
 
 
@@ -127,7 +127,7 @@ def test_server(build_dir, work):
     finally:
         if process.poll() is None:
             process.kill()
-    env = dict(server_env(data, api_port, stat_port), TELEGRAM_TDLIB_RESTART_DRAIN_TIMEOUT='0')
+    env = dict(server_env(data, api_port, stat_port), TELEGRAM_TDLIB_RESTART_DRAIN_TIMEOUT_SECONDS='0')
     process = run_entrypoint(binary_dir, env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     _, error = process.communicate(timeout=30)
     assert process.returncode != 0 and b'drain timeout' in error, (process.returncode, error)

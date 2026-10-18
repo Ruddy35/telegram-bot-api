@@ -215,7 +215,7 @@ def scenario_webhook():
     update_count = 300
     hook = Hook(delay=0.3)
     try:
-        with TestServer('webhook', ['--tdlib-restart-drain-timeout=10', '--tdlib-restart-cooldown=1'],
+        with TestServer('webhook', ['--tdlib-restart-drain-timeout-seconds=10', '--tdlib-restart-cooldown-seconds=1'],
                         update_count) as server:
             hook.server = server
             result, _ = server.api('setWebhook', url=hook.url, max_connections=10, secret_token='secret',
@@ -256,7 +256,7 @@ def scenario_webhook():
 
 def scenario_polling():
     """Restart with an active long polling request: the request is answered, next requests are served."""
-    with TestServer('polling', ['--tdlib-restart-cooldown=1'], 50) as server:
+    with TestServer('polling', ['--tdlib-restart-cooldown-seconds=1'], 50) as server:
         result, _ = server.api('getUpdates', limit=10)
         assert result['ok'] and len(result['result']) == 10, result
         got = [u['update_id'] for u in result['result']]
@@ -285,7 +285,7 @@ def scenario_polling():
 def scenario_polling_pending():
     """Updates, which weren't confirmed before a restart, and getUpdates requests delayed by the restart are served by
     the new instance: every update is received exactly once and in order."""
-    with TestServer('polling_pending', ['--tdlib-restart-cooldown=1'], 50) as server:
+    with TestServer('polling_pending', ['--tdlib-restart-cooldown-seconds=1'], 50) as server:
         result, _ = server.api('getUpdates', limit=10)  # the updates aren't confirmed
         first = result['result'][0]['update_id']
         received = []
@@ -320,7 +320,7 @@ def scenario_polling_pending():
 
 def scenario_drain_timeout():
     """A request, which can't be finished, prevents a restart; the restart is cancelled and nothing breaks."""
-    with TestServer('drain_timeout', ['--tdlib-restart-drain-timeout=3', '--tdlib-restart-cooldown=1']) as server:
+    with TestServer('drain_timeout', ['--tdlib-restart-drain-timeout-seconds=3', '--tdlib-restart-cooldown-seconds=1']) as server:
         assert server.api('getMe')[0]['ok']
         start_hanging_request(server)
         load = Load(server, ['getMe'], threads=4)
@@ -337,7 +337,7 @@ def scenario_drain_timeout():
 
 def scenario_cancel_with_getupdates():
     """A getUpdates request delayed by a restart, which is cancelled, is answered by the old instance."""
-    with TestServer('cancel_with_getupdates', ['--tdlib-restart-drain-timeout=3', '--tdlib-restart-cooldown=1'],
+    with TestServer('cancel_with_getupdates', ['--tdlib-restart-drain-timeout-seconds=3', '--tdlib-restart-cooldown-seconds=1'],
                     3) as server:
         assert server.api('getMe')[0]['ok']
         start_hanging_request(server)
@@ -356,7 +356,7 @@ def scenario_webhook_change():
     """A change of the webhook during a restart cancels the restart; updates aren't delivered twice."""
     hook = Hook(delay=3)
     try:
-        with TestServer('webhook_change', ['--tdlib-restart-drain-timeout=20', '--tdlib-restart-cooldown=1'],
+        with TestServer('webhook_change', ['--tdlib-restart-drain-timeout-seconds=20', '--tdlib-restart-cooldown-seconds=1'],
                         5) as server:
             assert server.api('setWebhook', url=hook.url, max_connections=1)[0]['ok']
             # the webhook answers in 3 seconds, so the restart waits for the update being sent
@@ -380,7 +380,7 @@ def scenario_webhook_change():
 
 def scenario_close_during_restart():
     """The method close during a restart cancels the restart; delayed requests are answered."""
-    with TestServer('close_during_restart', ['--tdlib-restart-drain-timeout=20', '--tdlib-restart-cooldown=1'],
+    with TestServer('close_during_restart', ['--tdlib-restart-drain-timeout-seconds=20', '--tdlib-restart-cooldown-seconds=1'],
                     3) as server:
         assert server.api('getMe')[0]['ok']
         start_hanging_request(server)
@@ -400,7 +400,7 @@ def scenario_close_during_restart():
 
 def scenario_shutdown_during_restart():
     """The server is stopped during a restart: it exits in time and delayed requests are answered."""
-    with TestServer('shutdown_during_restart', ['--tdlib-restart-drain-timeout=20', '--tdlib-restart-cooldown=1'],
+    with TestServer('shutdown_during_restart', ['--tdlib-restart-drain-timeout-seconds=20', '--tdlib-restart-cooldown-seconds=1'],
                     3) as server:
         assert server.api('getMe')[0]['ok']
         start_hanging_request(server)
@@ -418,7 +418,7 @@ def scenario_shutdown_during_restart():
 
 def scenario_restart_all():
     """All bots are restarted one by one on request; only one restart is done at a time."""
-    with TestServer('restart_all', ['--tdlib-restart-cooldown=1'], second_bot=True) as server:
+    with TestServer('restart_all', ['--tdlib-restart-cooldown-seconds=1'], second_bot=True) as server:
         assert server.api('getMe')[0]['ok'] and server.api('getMe', token=TOKEN2)[0]['ok']
         assert server.request_restart(123) == 0, 'unknown bot'
         assert server.request_restart('all') == 2
@@ -437,8 +437,8 @@ def scenario_restart_all():
 
 def scenario_policy():
     """Automatic restarts because of the memory limit and the uptime; restarts don't leak memory."""
-    with TestServer('memory_limit', ['--tdlib-restart-memory-limit=1', '--tdlib-restart-min-uptime=0',
-                                     '--tdlib-restart-cooldown=0']) as server:
+    with TestServer('memory_limit', ['--tdlib-restart-memory-limit-mib=1', '--tdlib-restart-min-uptime-seconds=0',
+                                     '--tdlib-restart-cooldown-seconds=0']) as server:
         load = Load(server, ['getMe', 'getWebhookInfo'], threads=4)
         wait_for(lambda: server.restart_count() >= 2, 30, 'restarts')
         first_heap = metric_sum(server.metrics(), 'tgbotapi_heap_bytes')
@@ -451,7 +451,7 @@ def scenario_policy():
         assert last_heap < 1.1 * first_heap, 'memory leak'
         assert 'because of memory limit' in '\n'.join(server.log_lines())
 
-    with TestServer('uptime', ['--tdlib-restart-interval=5', '--tdlib-restart-cooldown=0']) as server:
+    with TestServer('uptime', ['--tdlib-restart-interval-seconds=5', '--tdlib-restart-cooldown-seconds=0']) as server:
         load = Load(server, ['getMe'], threads=2)
         time.sleep(20)
         load.finish()
@@ -462,8 +462,8 @@ def scenario_policy():
 
 def scenario_policy_limits():
     """The minimum uptime and the cooldown limit automatic restarts."""
-    with TestServer('min_uptime', ['--tdlib-restart-memory-limit=1', '--tdlib-restart-min-uptime=6',
-                                   '--tdlib-restart-cooldown=0'], second_bot=True) as server:
+    with TestServer('min_uptime', ['--tdlib-restart-memory-limit-mib=1', '--tdlib-restart-min-uptime-seconds=6',
+                                   '--tdlib-restart-cooldown-seconds=0'], second_bot=True) as server:
         assert server.api('getMe')[0]['ok'] and server.api('getMe', token=TOKEN2)[0]['ok']
         wait_for(lambda: {bot_id for _, bot_id, _ in server.restart_starts()} == {BOT_ID, BOT2_ID}, 60,
                  'restarts of both bots')
@@ -472,8 +472,8 @@ def scenario_policy_limits():
         log('restarts with the minimum uptime of 6 seconds (time, bot, uptime):', starts)
         assert all(uptime >= 6 for _, _, uptime in starts), starts
 
-    with TestServer('cooldown', ['--tdlib-restart-memory-limit=1', '--tdlib-restart-min-uptime=0',
-                                 '--tdlib-restart-cooldown=8'], second_bot=True) as server:
+    with TestServer('cooldown', ['--tdlib-restart-memory-limit-mib=1', '--tdlib-restart-min-uptime-seconds=0',
+                                 '--tdlib-restart-cooldown-seconds=8'], second_bot=True) as server:
         assert server.api('getMe')[0]['ok'] and server.api('getMe', token=TOKEN2)[0]['ok']
         wait_for(lambda: len(server.restart_starts()) >= 3, 60, '3 restarts')
         times = [start[0] for start in server.restart_starts()]
@@ -483,7 +483,7 @@ def scenario_policy_limits():
 
 def scenario_malloc_trim():
     """Free memory is returned to the OS once after restarts."""
-    with TestServer('malloc_trim', ['--malloc-trim', '--tdlib-restart-cooldown=1']) as server:
+    with TestServer('malloc_trim', ['--malloc-trim', '--tdlib-restart-cooldown-seconds=1']) as server:
         assert server.api('getMe')[0]['ok']
         server.request_restart()
         wait_for(lambda: server.restart_count() >= 1, 30, 'restart')
@@ -496,11 +496,11 @@ def scenario_options():
     """Invalid values of options are rejected."""
     work = os.path.join(WORK_ROOT, 'options')
     os.makedirs(work, exist_ok=True)
-    for option in ['--tdlib-restart-drain-timeout=0', '--tdlib-restart-drain-timeout=3601',
-                   '--tdlib-restart-interval=-1', '--tdlib-restart-memory-limit=-1',
-                   '--tdlib-restart-bot-memory-limit=-1', '--tdlib-restart-min-uptime=-1', '--tdlib-restart-cooldown=-1',
-                   '--cpu-sampling-rate=-1', '--cpu-sampling-rate=1001', '--memory-sampling-interval=-1',
-                   '--memory-sampling-interval=1048577', '--message-unload-delay=59']:
+    for option in ['--tdlib-restart-drain-timeout-seconds=0', '--tdlib-restart-drain-timeout-seconds=3601',
+                   '--tdlib-restart-interval-seconds=-1', '--tdlib-restart-memory-limit-mib=-1',
+                   '--tdlib-restart-bot-memory-limit-mib=-1', '--tdlib-restart-min-uptime-seconds=-1', '--tdlib-restart-cooldown-seconds=-1',
+                   '--cpu-sampling-rate-hz=-1', '--cpu-sampling-rate-hz=1001', '--memory-sampling-interval-kib=-1',
+                   '--memory-sampling-interval-kib=1048577', '--message-unload-delay-seconds=59']:
         result = subprocess.run([os.path.join(BUILD_DIR, 'telegram-bot-api'), '--api-id=1', '--api-hash=test', '--local',
                                  '-p', str(testlib.free_port()), '-s', str(testlib.free_port()), '-d', work, option],
                                 capture_output=True, timeout=30)
@@ -617,8 +617,8 @@ def scenario_metrics():
 def scenario_metrics_disabled():
     """Without CPU and memory sampling their metrics aren't exported, and the bot memory limit is ignored."""
     error = 'TDLib restart bot memory limit is ignored'
-    with TestServer('metrics_disabled', ['--cpu-sampling-rate=0', '--memory-sampling-interval=0',
-                                         '--tdlib-restart-bot-memory-limit=1'], expected_errors=[error]) as server:
+    with TestServer('metrics_disabled', ['--cpu-sampling-rate-hz=0', '--memory-sampling-interval-kib=0',
+                                         '--tdlib-restart-bot-memory-limit-mib=1'], expected_errors=[error]) as server:
         assert server.api('getMe')[0]['ok']
         time.sleep(1.5)
         names = {name for name, _ in server.metrics()}
@@ -650,7 +650,7 @@ def check_cpu_metrics(values):
 
 def scenario_resources():
     """CPU time, storage and memory usage of the bot are exported and CPU time is accumulated across restarts."""
-    with TestServer('resources', ['--tdlib-restart-cooldown=1']) as server:
+    with TestServer('resources', ['--tdlib-restart-cooldown-seconds=1']) as server:
         assert server.api('getMe')[0]['ok']
 
         def tdlib_load():
@@ -716,7 +716,7 @@ def check_memory_metrics(values):
 
 def scenario_memory():
     """Memory of each bot is estimated, attributed to the right bot and is used to restart TDLib instances."""
-    with TestServer('memory', ['--memory-sampling-interval=16'], second_bot=True) as server:
+    with TestServer('memory', ['--memory-sampling-interval-kib=16'], second_bot=True) as server:
         assert server.api('getMe')[0]['ok'] and server.api('getMe', token=TOKEN2)[0]['ok']
         time.sleep(1)
         values = server.metrics()
@@ -754,8 +754,8 @@ def scenario_memory():
         time.sleep(3)
 
     # only the bot, which exceeds the memory limit, is restarted, and restarts don't leak memory
-    with TestServer('memory_limit', ['--memory-sampling-interval=4', '--tdlib-restart-bot-memory-limit=1',
-                                     '--tdlib-restart-min-uptime=2', '--tdlib-restart-cooldown=1'],
+    with TestServer('memory_limit', ['--memory-sampling-interval-kib=4', '--tdlib-restart-bot-memory-limit-mib=1',
+                                     '--tdlib-restart-min-uptime-seconds=2', '--tdlib-restart-cooldown-seconds=1'],
                     second_bot=True) as server:
         assert server.api('getMe')[0]['ok'] and server.api('getMe', token=TOKEN2)[0]['ok']
         load = Load(server, ['getMe', 'getWebhookInfo'], threads=4)

@@ -10,7 +10,7 @@ In every round the servers of all configurations run at the same time with two o
 load. A pause of the whole machine (for example, of a virtual machine by its host) delays all of them at the same time,
 so paired comparison of rounds cancels it out. The ports of the configurations alternate between rounds.
  - Load: requests with a fixed total rate over many keep-alive connections; a mix of methods answered by Bot API
-   (getMe, getWebhookInfo), by TDLib (getChatMember, getFile) and requests with 100 KB bodies.
+   (getMe, getWebhookInfo), by TDLib (getChatMember, getFile) and requests with 100000-byte bodies.
  - Probes: requests sent by a fixed schedule; latency is measured from the scheduled time, so a stall of a server
    delays every probe scheduled during the stall. The "client" probe is getMe, answered by Bot API; the "tdlib" probe
    is getChatMember, answered by TDLib. A probe is "stalled" if it is delayed by more than 10 ms, and "own stalled" if
@@ -267,13 +267,13 @@ class ServerRun:
 
     def start_load(self, duration, seed):
         processes = self.options.load_processes
-        return [self.spawn('load', self.server.api_port, duration, self.options.load_rate / processes,
+        return [self.spawn('load', self.server.api_port, duration, self.options.load_requests_per_second / processes,
                            self.options.load_connections // processes, seed + i) for i in range(processes)]
 
     def begin(self):
         self.metrics_before = self.server.metrics()
         self.cpu_before = self.server.cpu_seconds()
-        duration = self.options.duration
+        duration = self.options.duration_seconds
         return self.start_load(duration, self.round_index * 100) + [self.spawn('probe', self.server.api_port, duration)]
 
     def finish(self, outputs):
@@ -330,7 +330,7 @@ def run_round(configs, round_index, options, work_root):
                 assert result.get('ok'), result
         collect([process for run in runs for process in run.start_load(WARM_UP_DURATION, 0)], WARM_UP_DURATION + 60)
         processes = [run.begin() for run in runs]
-        outputs = [collect(run_processes, options.duration + 60) for run_processes in processes]
+        outputs = [collect(run_processes, options.duration_seconds + 60) for run_processes in processes]
         results = [run.finish(output) for run, output in zip(runs, outputs)]
     except BaseException:
         for run in runs:
@@ -438,8 +438,8 @@ def main():
     parser.add_argument('--config', type=parse_config, action='append', default=[],
                         help='NAME=BINARY[,ARGUMENT]...; the first configuration is the baseline')
     parser.add_argument('--rounds', type=int, default=40)
-    parser.add_argument('--duration', type=float, default=10.0, help='seconds of measurement in each round')
-    parser.add_argument('--load-rate', type=float, default=2000.0, help='requests per second to each server')
+    parser.add_argument('--duration-seconds', type=float, default=10.0, help='duration of measurement in each round')
+    parser.add_argument('--load-requests-per-second', type=float, default=2000.0, help='rate of the load of each server')
     parser.add_argument('--load-connections', type=int, default=64)
     parser.add_argument('--load-processes', type=int, default=2)
     parser.add_argument('--json', help='file to save raw results to')

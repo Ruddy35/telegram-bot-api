@@ -71,7 +71,7 @@ double chunk_size(std::size_t size) {
     chunk = 32;
   }
   if (chunk >= (static_cast<std::size_t>(128) << 10)) {
-    // glibc allocates chunks of at least 128 KB with mmap
+    // glibc allocates chunks of at least 128 KiB with mmap
     return static_cast<double>((chunk + 8 + 4095) & ~static_cast<std::size_t>(4095));
   }
   return static_cast<double>(chunk);
@@ -143,7 +143,7 @@ bool verify(const void *ptr, std::size_t size, const void *pattern_ptr) {
 
 // 1. all allocation functions under concurrent use with very frequent sampling
 void test_stress() {
-  std::printf("== stress: all allocation functions, 8 threads, sampling interval 4 KB\n");
+  std::printf("== stress: all allocation functions, 8 threads, sampling interval 4 KiB\n");
   HeapSampler::set_sampling_interval(4096);
   std::atomic<int> errors{0};
   static std::atomic<int> error_kinds[6];
@@ -239,7 +239,7 @@ void test_stress() {
             break;
           }
           case 4:
-            alignment = static_cast<std::size_t>(1) << (3 + rng() % 11);  // up to 8 KB
+            alignment = static_cast<std::size_t>(1) << (3 + rng() % 11);  // up to 8 KiB
             p = memalign(alignment, size);
             break;
           case 5:
@@ -411,7 +411,7 @@ void run_accuracy(const char *name, double interval, const std::vector<double> &
     max_abs = std::max(max_abs, std::fabs(z));
   }
   double stddev = std::sqrt(variance / static_cast<double>(z_scores.size() - 1));
-  std::printf("%-34s interval %4.0f KB:", name, interval / 1024);
+  std::printf("%-34s interval %4.0f KiB:", name, interval / 1024);
   for (std::size_t i = 0; i < owners.size(); i++) {
     std::printf(" %s %.1f%%",
                 owners[i]->target >= 1e9 ? (std::to_string(static_cast<int>(owners[i]->target / 1e9)) + "GB").c_str()
@@ -470,7 +470,7 @@ void test_accuracy() {
   run_accuracy("mixed sizes", 65536, targets, mixed, false);
   run_accuracy("mixed sizes", 262144, targets, mixed, false);
   run_accuracy("tiny sizes 0-63", 65536, {5e8, 1e8, 2e7}, tiny, false);
-  run_accuracy("large sizes 32 KB - 4 MB", 65536, {2e9, 5e8, 1e8}, large, false);
+  run_accuracy("large sizes 32 KiB - 4 MiB", 65536, {2e9, 5e8, 1e8}, large, false);
   run_accuracy("heavy-tailed sizes (Pareto 1.1)", 65536, targets, pareto, false);
   run_accuracy("mixed sizes with realloc growth", 65536, targets, mixed, true);
 }
@@ -528,7 +528,7 @@ void run_bias(const char *name, double interval, double heap_size,
   double mean = sum_z / RUNS;
   double stddev = std::sqrt(sum_z2 / RUNS - mean * mean);
   std::printf(
-      "%-34s interval %4.0f KB, %d heaps of %.0f MB: mean error %+.3f%%, z mean %+.3f (must be within +-%.2f), "
+      "%-34s interval %4.0f KiB, %d heaps of %.0f MB: mean error %+.3f%%, z mean %+.3f (must be within +-%.2f), "
       "z stddev %.2f\n",
       name, interval / 1024, RUNS, heap_size / 1e6, sum_relative / RUNS * 100, mean, 3 / std::sqrt(RUNS * 1.0), stddev);
   CHECK_TEST(std::fabs(mean) < 3 / std::sqrt(RUNS * 1.0), "%s: biased estimate, z mean %.3f", name, mean);
@@ -563,13 +563,13 @@ void test_bias() {
     return static_cast<std::size_t>(std::min(32.0 / std::pow(u, 1 / 1.1), 64e6));
   };
   auto around_interval = [](std::mt19937_64 &rng) {
-    return static_cast<std::size_t>(rng() % 200000);
+    return static_cast<std::size_t>(rng() % (200 << 10));
   };
   run_bias("tiny sizes 0-63", 65536, 2e7, tiny);
   run_bias("mixed sizes", 65536, 5e7, mixed);
   run_bias("mixed sizes", 262144, 5e7, mixed);
   run_bias("heavy-tailed sizes (Pareto 1.1)", 65536, 5e7, pareto);
-  run_bias("sizes 0-200 KB around the interval", 65536, 2e8, around_interval);
+  run_bias("sizes 0-200 KiB around interval", 65536, 2e8, around_interval);
 }
 
 // 3. attribution: owners, contexts, cross-thread frees, destroyed owners
@@ -958,24 +958,24 @@ void test_api() {
   data = static_cast<unsigned char *>(escape(realloc(data, 3000)));
   check_block(data, 100, "small slot -> page run");
   fill_block(data, 3000);
-  const std::size_t MB = 1 << 20;
-  data = static_cast<unsigned char *>(escape(realloc(data, MB + MB / 2)));
+  const std::size_t MiB = 1 << 20;
+  data = static_cast<unsigned char *>(escape(realloc(data, MiB + MiB / 2)));
   check_block(data, 3000, "page run -> bigger page run");
-  fill_block(data, MB + MB / 2);
-  auto *same = static_cast<unsigned char *>(escape(realloc(data, 2 * MB - 100)));
+  fill_block(data, MiB + MiB / 2);
+  auto *same = static_cast<unsigned char *>(escape(realloc(data, 2 * MiB - 100)));
   CHECK_TEST(same == data, "growth in place");
-  check_block(data, MB + MB / 2, "growth in place");
+  check_block(data, MiB + MiB / 2, "growth in place");
   CHECK_TEST(samples(a) == 1, "one sample after growth");
   set_context(0xB100);
-  same = static_cast<unsigned char *>(escape(realloc(data, MB + MB / 4)));
+  same = static_cast<unsigned char *>(escape(realloc(data, MiB + MiB / 4)));
   CHECK_TEST(same == data, "shrink in place");
-  check_block(data, MB + MB / 4, "shrink in place");
+  check_block(data, MiB + MiB / 4, "shrink in place");
   CHECK_TEST(samples(a) == 0 && samples(b) == 1, "a resized block belongs to the new context");
-  data = static_cast<unsigned char *>(escape(realloc(data, 20 * MB)));
-  check_block(data, MB + MB / 4, "page run -> 20 MB");
-  fill_block(data, 20 * MB);
-  data = static_cast<unsigned char *>(escape(realloc(data, 33 * MB)));
-  check_block(data, 20 * MB, "20 MB -> committed 33 MB");
+  data = static_cast<unsigned char *>(escape(realloc(data, 20 * MiB)));
+  check_block(data, MiB + MiB / 4, "page run -> 20 MiB");
+  fill_block(data, 20 * MiB);
+  data = static_cast<unsigned char *>(escape(realloc(data, 33 * MiB)));
+  check_block(data, 20 * MiB, "20 MiB -> committed 33 MiB");
   HeapSampler::set_sampling_interval(0);
   data = static_cast<unsigned char *>(escape(realloc(data, 100)));
   check_block(data, 100, "sampled -> not sampled");
@@ -988,18 +988,18 @@ void test_api() {
   CHECK_TEST(samples(a) == 0 && samples(b) == 0, "all samples are freed");
   set_context(0);
 
-  // freed runs keep at most 8 MB of memory
+  // freed runs keep at most 8 MiB of memory
   auto overhead_before = HeapSampler::get_stats().sampler_overhead_bytes;
   std::vector<void *> blocks;
   for (int i = 0; i < 20; i++) {
-    blocks.push_back(escape(malloc(MB)));
-    std::memset(blocks.back(), 1, MB);
+    blocks.push_back(escape(malloc(MiB)));
+    std::memset(blocks.back(), 1, MiB);
   }
   for (auto p : blocks) {
     free(p);
   }
   auto overhead = HeapSampler::get_stats().sampler_overhead_bytes - overhead_before;
-  CHECK_TEST(overhead <= static_cast<td::int64>(8 * MB), "sampler keeps %lld more bytes of freed memory",
+  CHECK_TEST(overhead <= static_cast<td::int64>(8 * MiB), "sampler keeps %lld more bytes of freed memory",
              static_cast<long long>(overhead));
   HeapSampler::remove_context(0xA100, a);
   HeapSampler::remove_context(0xB100, b);

@@ -141,9 +141,9 @@ def write_csv(path, rows):
 
 
 def watch(options):
-    report = Report('server %s, %g s' % (options.url, options.duration))
+    report = Report('server %s, %g s' % (options.url, options.duration_seconds))
     rows = []
-    deadline = time.time() + options.duration
+    deadline = time.time() + options.duration_seconds
     scrape = 0
     while True:
         with urllib.request.urlopen(options.url, timeout=30) as r:
@@ -156,9 +156,9 @@ def watch(options):
         print('scrape %d: %d bots (%d skipped), within 1/2/3 sigma %s, max |z| %.2f' % (
             scrape, len(z), skipped, '/'.join('%.0f%%' % (sum(1 for x in z if abs(x) <= k) / max(len(z), 1) * 100)
                                               for k in [1, 2, 3]), max([abs(x) for x in z] or [0])), flush=True)
-        if time.time() + options.period > deadline:
+        if time.time() + options.period_seconds > deadline:
             break
-        time.sleep(options.period)
+        time.sleep(options.period_seconds)
     write_csv(options.csv, rows)
     return report.check(independent_groups=False)
 
@@ -183,7 +183,7 @@ def run_offline_server(options, interval, run, rng, work):
     """Runs one offline server, gives its bots random amounts of memory and returns its observations."""
     testlib.prepare_work_dir(options.build, work)
     server = testlib.Server(os.path.join(options.build, 'telegram-bot-api'), work,
-                            ['--memory-sampling-interval=%d' % interval], env={'TELEGRAM_BOT_API_MEMORY_AUDIT': '1'})
+                            ['--memory-sampling-interval-kib=%d' % interval], env={'TELEGRAM_BOT_API_MEMORY_AUDIT': '1'})
     with server:
         for token, _ in testlib.BOTS:
             assert server.api('getMe', token=token)[0]['ok']
@@ -220,14 +220,14 @@ def offline(options):
     ok = True
     rows = []
     try:
-        for interval in options.intervals:
-            report = Report('offline servers, sampling interval %d KB, %d runs' % (interval, options.runs))
+        for interval in options.intervals_kib:
+            report = Report('offline servers, sampling interval %d KiB, %d runs' % (interval, options.runs))
             for run in range(options.runs):
                 work = os.path.join(work_root, '%d-%d' % (interval, run))
                 observations, _, heap = run_offline_server(options, interval, run, rng, work)
                 shutil.rmtree(work, ignore_errors=True)
                 report.add_group(observations, heap)
-                rows.extend(('%dKB-%d' % (interval, run), o) for o in observations)
+                rows.extend(('%dKiB-%d' % (interval, run), o) for o in observations)
                 print('run %d: %s' % (run + 1, ', '.join('bot %s %.1f MB z %+.2f' % (
                     o['bot'], o['exact'] / 1e6, z_score(o)) for o in observations)), flush=True)
             ok = report.check(independent_groups=True) and ok
@@ -246,12 +246,12 @@ def main():
     watch_parser = modes.add_parser('watch', parents=[common],
                                     help='check a running server, for example, a canary with real bots')
     watch_parser.add_argument('url', help='metrics URL, for example, http://127.0.0.1:8082/metrics')
-    watch_parser.add_argument('--duration', type=float, default=600.0)
-    watch_parser.add_argument('--period', type=float, default=15.0)
+    watch_parser.add_argument('--duration-seconds', type=float, default=600.0)
+    watch_parser.add_argument('--period-seconds', type=float, default=15.0)
     offline_parser = modes.add_parser('offline', parents=[common], help='check independent offline servers with test bots')
     offline_parser.add_argument('build', help='build directory with telegram-bot-api and restart-test-fake-auth')
     offline_parser.add_argument('--runs', type=int, default=30, help='servers for each sampling interval')
-    offline_parser.add_argument('--intervals', type=lambda s: [int(x) for x in s.split(',')], default=[64, 16],
+    offline_parser.add_argument('--intervals-kib', type=lambda s: [int(x) for x in s.split(',')], default=[64, 16],
                                 help='sampling intervals in kilobytes')
     offline_parser.add_argument('--seed', type=int, default=1)
     options = parser.parse_args()

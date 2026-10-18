@@ -45,7 +45,7 @@ A restart of a bot has three phases; `ClientManager` keeps the state of the bot,
    with the same token and database, so no new login is needed, restores the webhook from `webhooks_db.binlog`, as on
    server start, and passes it all delayed requests in their original order.
 
-The first two phases must finish in `--tdlib-restart-drain-timeout` seconds in total, excluding the time to disable
+The first two phases must finish in `--tdlib-restart-drain-timeout-seconds` seconds in total, excluding the time to disable
 network. Otherwise the restart is **cancelled**: the webhook and the network are resumed, delayed requests are passed
 to the old instance, and the bot works as before. A restart is also cancelled if the webhook is changed during it, and
 it doesn't start while `setWebhook` is being processed. If the instance is being closed for another reason (`logOut`,
@@ -56,37 +56,37 @@ Requests are delayed from the start of the second phase until the new instance i
 network is disabled; closing and opening of a big database takes longer.
 
 Delayed requests fail with `429 Too Many Requests: retry after 1` only if a restart lasts more than
-`--tdlib-restart-drain-timeout` plus 120 seconds, which doesn't happen in practice, because closing and opening an
+`--tdlib-restart-drain-timeout-seconds` plus 120 seconds, which doesn't happen in practice, because closing and opening an
 instance takes from milliseconds to a few seconds.
 
 ## When restarts happen
 
-Only one instance is restarted at a time, and starts of restarts are separated by at least `--tdlib-restart-cooldown`
+Only one instance is restarted at a time, and starts of restarts are separated by at least `--tdlib-restart-cooldown-seconds`
 seconds. A cancelled automatic restart is retried after 5 minutes multiplied by the number of failures in a row, but
 not later than in an hour.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--tdlib-restart-memory-limit=<MB>` | disabled | While resident memory of the server exceeds the limit, restart the instance, which uses the most memory, checking every 5 seconds. Memory of an instance is estimated by memory accounting (part `client` plus part `tdlib` in [METRICS.md](METRICS.md)), or by the number of updates received from TDLib if the accounting is disabled |
-| `--tdlib-restart-bot-memory-limit=<MB>` | disabled | Restart the instance of a bot, which uses more memory than the limit, checking every 5 seconds. Requires memory accounting |
-| `--tdlib-restart-min-uptime=<seconds>` | 3600 | Instances, which work less than this time, aren't restarted because of the memory limits. It prevents endless restarts if memory isn't released, for example, because of heap fragmentation |
-| `--tdlib-restart-interval=<seconds>` | disabled | Restart each instance after it works for the specified time plus a random delay of up to 10% |
-| `--tdlib-restart-drain-timeout=<seconds>` | 30 | Maximum duration of the first two phases, 1-3600 |
-| `--tdlib-restart-cooldown=<seconds>` | 10 | Minimum delay between starts of restarts, including requested ones |
+| `--tdlib-restart-memory-limit-mib=<MiB>` | disabled | While resident memory of the server exceeds the limit, restart the instance, which uses the most memory, checking every 5 seconds. Memory of an instance is estimated by memory accounting (part `client` plus part `tdlib` in [METRICS.md](METRICS.md)), or by the number of updates received from TDLib if the accounting is disabled |
+| `--tdlib-restart-bot-memory-limit-mib=<MiB>` | disabled | Restart the instance of a bot, which uses more memory than the limit, checking every 5 seconds. Requires memory accounting |
+| `--tdlib-restart-min-uptime-seconds=<seconds>` | 3600 | Instances, which work less than this time, aren't restarted because of the memory limits. It prevents endless restarts if memory isn't released, for example, because of heap fragmentation |
+| `--tdlib-restart-interval-seconds=<seconds>` | disabled | Restart each instance after it works for the specified time plus a random delay of up to 10% |
+| `--tdlib-restart-drain-timeout-seconds=<seconds>` | 30 | Maximum duration of the first two phases, 1-3600 |
+| `--tdlib-restart-cooldown-seconds=<seconds>` | 10 | Minimum delay between starts of restarts, including requested ones |
 | `--malloc-trim` | disabled | Call `malloc_trim(0)` 10 seconds after the last restart to return free memory to the OS; only for the glibc allocator |
-| `--message-unload-delay=<seconds>` | TDLib default | Delay after which unused messages are unloaded from memory of TDLib instances, 60-86400 |
+| `--message-unload-delay-seconds=<seconds>` | TDLib default | Delay after which unused messages are unloaded from memory of TDLib instances, 60-86400 |
 
 Without these options the server behaves as the original server.
 
 Example for a server with dozens of bots and a memory limit of 8 GB:
 
 ```
-telegram-bot-api ... --tdlib-restart-memory-limit=5500 --tdlib-restart-bot-memory-limit=1500
+telegram-bot-api ... --tdlib-restart-memory-limit-mib=5500 --tdlib-restart-bot-memory-limit-mib=1500
 ```
 
 Choose the bot memory limit above the memory, which ordinary bots use after a day of work, using
 `tgbotapi_bot_memory_bytes{part=~"client|tdlib"}`. A bot, which uses more memory than the limit right after a
-restart, is restarted once in `--tdlib-restart-min-uptime` seconds; such restarts are visible in
+restart, is restarted once in `--tdlib-restart-min-uptime-seconds` seconds; such restarts are visible in
 `tgbotapi_bot_tdlib_restarts_total`.
 
 ## Manual restarts and monitoring
@@ -103,8 +103,8 @@ curl 'http://127.0.0.1:<stat port>/?restart=all'        # restart all instances 
 requested restarts. Requested restarts are started before other restarts.
 
 The statistics page has new lines `tdlib_restart_count` and `tdlib_failed_restart_count` for the server and
-`tdlib_update_count`, `tdlib_restart_count`, `tdlib_next_restart_in` for each bot; during a restart also
-`tdlib_restart_state` (`pausing`, `draining` or `closing`), `tdlib_restart_duration` and
+`tdlib_update_count`, `tdlib_restart_count`, `tdlib_next_restart_in_seconds` for each bot; during a restart also
+`tdlib_restart_state` (`pausing`, `draining` or `closing`), `tdlib_restart_duration_seconds` and
 `tdlib_restart_delayed_query_count`. `uptime` of a bot is the uptime of its current instance. Metrics of restarts are
 described in [METRICS.md](METRICS.md).
 
@@ -121,10 +121,10 @@ Released free memory to the OS in <seconds> seconds
 ## Limitations
 
 * A bot, which sends requests continuously regardless of updates, for example, a mailing, may not finish its requests
-  in `--tdlib-restart-drain-timeout` seconds. Then the restart is cancelled and retried later. During such an attempt
+  in `--tdlib-restart-drain-timeout-seconds` seconds. Then the restart is cancelled and retried later. During such an attempt
   only receiving of updates is delayed, not requests.
 * If a long request was received right before the second phase, requests of the bot wait for it, but not more than
-  `--tdlib-restart-drain-timeout` seconds since the start of the restart.
+  `--tdlib-restart-drain-timeout-seconds` seconds since the start of the restart.
 * While an instance is being restarted, the bot receives no new updates. They are received after the restart.
 * With glibc resident memory may decrease only partially after a restart because of heap fragmentation, but the freed
   memory is reused. `--malloc-trim` returns it to the OS.

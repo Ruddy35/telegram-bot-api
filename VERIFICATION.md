@@ -1,7 +1,8 @@
 # Verification
 
 This document lists the claims about the changes of the fork, and for each claim how it is proven or tested, the
-command to repeat the check and the result. All tests run without network access.
+command to repeat the check and the result. All tests run without network access. KiB and MiB are 1024 and 1048576
+bytes; kB, MB and GB are 10^3, 10^6 and 10^9 bytes.
 
 ```
 test/run_all.sh <build dir>   # all tests below except the long experiments; prints ALL TESTS PASSED
@@ -12,7 +13,7 @@ test/run_all.sh <build dir>   # all tests below except the long experiments; pri
 | A graceful restart doesn't fail requests, lose or duplicate updates, or change the webhook | Integration scenarios with a real server | `test/restart/restart_test.py` | All outcomes below pass |
 | Every answered request of a bot is counted exactly once, and the metrics page is valid | Scenarios compare the counted requests with the requests answered to the test; every page read by the tests is validated | `test/restart/restart_test.py` | Pass |
 | The total heap size is counted exactly | Comparison with statistics of glibc and jemalloc | `heap-sampler-test exact stress drift limits` | Equal to the byte |
-| The memory estimate of a bot is unbiased and its reported standard deviation σ is right | A proof below; 1000 independent model heaps; 200 independent real servers | `heap-sampler-test bias`, `verify_memory_accuracy.py offline` | Mean z within ±0.15 and coverage of 2σ 94.5-98% on model heaps; 93.8-95.2% on real servers |
+| The memory estimate of a bot is unbiased and its reported standard deviation σ is right | A proof below; 1000 independent model heaps; 200 independent real servers | `heap-sampler-test bias`, `verify_memory_accuracy.py offline` | Mean z within ±0.12 and coverage of 2σ 92-98% on model heaps; 93.8-95.2% on real servers |
 | Memory accounting doesn't break allocations | Concurrent stress of all allocation functions with pattern checks; all results and errors of each function | `heap-sampler-test stress api edge limits` | 0 errors with glibc and jemalloc, in the normal and audit modes |
 | Memory accounting doesn't add latency or stalls | Concurrent A/B test of the server with and without memory accounting | `latency_ab.py` | No failures of 1080120 requests; an increase of p50, p99 and p99.9 latency is rejected; +0.9% CPU time per request |
 | The Docker image passes options from environment variables and works | The entrypoint with a fake server; the real server started by the entrypoint; a container of the image | `test/test_docker.py` | Pass |
@@ -56,7 +57,7 @@ delayed requests and a restart lasting longer than the drain timeout plus 120 se
 ### Why the estimate is right
 
 **Sampling.** Each thread counts allocated bytes. Sampling is a Poisson process with the rate `1/T` on the axis of
-allocated bytes, where `T` is `--memory-sampling-interval`: the number of bytes until the next sample is exponentially
+allocated bytes, where `T` is `--memory-sampling-interval-kib`: the number of bytes until the next sample is exponentially
 distributed. An allocation of `n` bytes takes `n + 16` bytes of the axis and is sampled if a sample point falls into
 it. Numbers of points of a Poisson process in disjoint segments are independent, so allocations are sampled
 **independently** with the probability
@@ -92,7 +93,7 @@ ones:
 `sqrt(V̂)` is exported as `tgbotapi_bot_memory_error_bytes`. For allocations much smaller than `T` the term is about
 `T c² / (n + 16) ≈ T c`, and allocations much bigger than `T` are almost always sampled and add almost no error, so
 `σ ≈ sqrt(T X)`:
-with `T = 64 KB` the relative error σ / X is 5.7% for 20 MB, 2.6% for 100 MB, 1.1% for 500 MB and 0.6% for 2 GB.
+with `T = 64 KiB` the relative error σ / X is 5.7% for 20 MB, 2.6% for 100 MB, 1.1% for 500 MB and 0.6% for 2 GB.
 
 **Distribution.** `X̂` is a sum of many independent bounded terms, so by the central limit theorem it is almost
 normal if σ is much bigger than `T`: the real value is within 1σ, 2σ and 3σ of the estimate in 68.3%, 95.4% and 99.7%
@@ -115,7 +116,7 @@ TELEGRAM_BOT_API_MEMORY_AUDIT=1 <build dir>/heap-sampler-test [test]...
 
 | Test | Checks |
 |---|---|
-| `stress` | 8 threads call all allocation functions with sampling every 4 KB; contents of every block are checked by a pattern, `calloc` by zeros, alignment and `malloc_usable_size` by their contracts; the exact counter equals the allocator statistics after all threads finish |
+| `stress` | 8 threads call all allocation functions with sampling every 4 KiB; contents of every block are checked by a pattern, `calloc` by zeros, alignment and `malloc_usable_size` by their contracts; the exact counter equals the allocator statistics after all threads finish |
 | `exact` | The exact counter equals `mallinfo2` of glibc or `stats.allocated` of jemalloc with a million live blocks |
 | `attribution` | Blocks stay with their owner when freed by another thread in another context; `realloc` moves a block to the current owner; parts; the last registration of a context wins; memory of destroyed owners becomes unattributed |
 | `edge` | Empty and huge blocks, failed allocations, lazily committed big blocks, disabled sampling, reuse of owner slots, `fork` during sampling |
@@ -129,27 +130,27 @@ TELEGRAM_BOT_API_MEMORY_AUDIT=1 <build dir>/heap-sampler-test [test]...
 Results of `bias` with glibc:
 
 ```
-tiny sizes 0-63                    interval   64 KB, 200 heaps of 20 MB: mean error -0.476%, z mean -0.081 (must be within +-0.21), z stddev 1.00
-                                   reported sigma: variance / theoretical 0.994, exact value within 1/2/3 sigma: 72.0%/95.0%/99.5%
-mixed sizes                        interval   64 KB, 200 heaps of 50 MB: mean error +0.083%, z mean +0.023 (must be within +-0.21), z stddev 0.90
-                                   reported sigma: variance / theoretical 1.001, exact value within 1/2/3 sigma: 72.5%/97.0%/100.0%
-mixed sizes                        interval  256 KB, 200 heaps of 50 MB: mean error -0.149%, z mean -0.021 (must be within +-0.21), z stddev 0.98
-                                   reported sigma: variance / theoretical 0.998, exact value within 1/2/3 sigma: 68.5%/94.5%/100.0%
-heavy-tailed sizes (Pareto 1.1)    interval   64 KB, 200 heaps of 50 MB: mean error -0.003%, z mean +0.010 (must be within +-0.21), z stddev 0.90
-                                   reported sigma: variance / theoretical 0.999, exact value within 1/2/3 sigma: 73.5%/97.0%/100.0%
-sizes 0-200 KB around the interval interval   64 KB, 200 heaps of 200 MB: mean error +0.065%, z mean +0.062 (must be within +-0.21), z stddev 0.99
-                                   reported sigma: variance / theoretical 1.001, exact value within 1/2/3 sigma: 70.5%/94.5%/100.0%
+tiny sizes 0-63                    interval   64 KiB, 200 heaps of 20 MB: mean error -0.445%, z mean -0.075 (must be within +-0.21), z stddev 1.01
+                                   reported sigma: variance / theoretical 0.995, exact value within 1/2/3 sigma: 67.5%/94.5%/100.0%
+mixed sizes                        interval   64 KiB, 200 heaps of 50 MB: mean error +0.102%, z mean +0.028 (must be within +-0.21), z stddev 1.05
+                                   reported sigma: variance / theoretical 1.001, exact value within 1/2/3 sigma: 64.5%/94.0%/99.5%
+mixed sizes                        interval  256 KiB, 200 heaps of 50 MB: mean error -0.706%, z mean -0.098 (must be within +-0.21), z stddev 1.02
+                                   reported sigma: variance / theoretical 0.993, exact value within 1/2/3 sigma: 64.0%/95.0%/100.0%
+heavy-tailed sizes (Pareto 1.1)    interval   64 KiB, 200 heaps of 50 MB: mean error -0.041%, z mean -0.007 (must be within +-0.21), z stddev 1.01
+                                   reported sigma: variance / theoretical 0.999, exact value within 1/2/3 sigma: 63.0%/96.5%/99.0%
+sizes 0-200 KiB around interval    interval   64 KiB, 200 heaps of 200 MB: mean error +0.094%, z mean +0.091 (must be within +-0.21), z stddev 1.02
+                                   reported sigma: variance / theoretical 1.002, exact value within 1/2/3 sigma: 70.5%/95.5%/100.0%
 ```
 
 All tests pass with glibc and jemalloc, in the normal and audit modes. Over these 20 combinations of a distribution and
-a mode mean z is between -0.15 and +0.06, the standard deviation of z is between 0.90 and 1.05, the mean reported
-variance is 0.992-1.002 of the theoretical one, and the exact value is within 1σ, 2σ, 3σ of the estimate in
-62-73.5%, 94.5-98% and 99-100% of heaps.
+a mode mean z is between -0.12 and +0.09, the standard deviation of z is between 0.91 and 1.10, the mean reported
+variance is 0.993-1.005 of the theoretical one, and the exact value is within 1σ, 2σ, 3σ of the estimate in
+61.5-72.5%, 92-98% and 98.5-100% of heaps.
 
 ### Real servers: `verify_memory_accuracy.py offline`
 
 ```
-python3 test/verify/verify_memory_accuracy.py offline <build dir> --runs=100 --intervals=64,16 --csv=accuracy.csv
+python3 test/verify/verify_memory_accuracy.py offline <build dir> --runs=100 --intervals-kib=64,16 --csv=accuracy.csv
 ```
 
 Each run is a new server process in the audit mode with two test bots. Each bot gets a random number (10-20000) of
@@ -164,12 +165,12 @@ Results of 100 runs for each interval (bots with at least 30 expected samples):
 
 | Interval | Observations | Within 1σ | Within 2σ | Within 3σ | Mean z | Standard deviation of z | Total error |
 |---|---|---|---|---|---|---|---|
-| 64 KB | 167 | 64.7% | 95.2% | 98.8% | -0.03 (allowed ±0.23) | 1.06 (allowed 1.21) | +0.31% of 712 MB |
-| 16 KB | 193 | 66.3% | 93.8% | 99.5% | -0.06 (allowed ±0.22) | 1.07 (allowed 1.20) | +0.08% of 737 MB |
+| 64 KiB | 167 | 64.7% | 95.2% | 98.8% | -0.03 (allowed ±0.23) | 1.06 (allowed 1.21) | +0.31% of 712 MB |
+| 16 KiB | 193 | 66.3% | 93.8% | 99.5% | -0.06 (allowed ±0.22) | 1.07 (allowed 1.20) | +0.08% of 737 MB |
 | Normal distribution | | 68.3% | 95.4% | 99.7% | 0 | 1 | |
 
 The estimate of the whole heap was within 2.7σ and 3.6σ in all runs. Test bots use only 1-10 MB of memory, so their
-relative errors are big (median 7.6% with 64 KB and 3.8% with 16 KB), exactly as large as the server reports for such
+relative errors are big (median 7.6% with 64 KiB and 3.8% with 16 KiB), exactly as large as the server reports for such
 amounts; the error decreases as `1/sqrt(X)`. 3 of 360 observations are beyond 3σ, while about 1 is expected; they have
 11, 69 and 256 samples, and 2 of them are underestimates. Of the 131 observations with at least 100 samples one is
 beyond 3σ (-3.09σ). For the bot memory limit an underestimate is the safe side: it can only postpone a restart.
@@ -181,7 +182,7 @@ beyond 3σ (-3.09σ). For the bot memory limit an underestimate is the safe side
 2. Run the check, for example, for an hour:
 
    ```
-   python3 test/verify/verify_memory_accuracy.py watch http://<stat address>:<stat port>/metrics --duration=3600 --period=60
+   python3 test/verify/verify_memory_accuracy.py watch http://<stat address>:<stat port>/metrics --duration-seconds=3600 --period-seconds=60
    ```
 
 The tool computes z for every bot with enough samples in every scrape and prints `ALL CHECKS PASSED` or the failed
@@ -195,7 +196,7 @@ header of the real allocator and adds it to the exact counter of the thread: no 
 
 **The slow path**, once per `T` bytes on average, places the sampled block in the reserved range and updates free
 lists, the context table and owner counters under a mutex: O(1) work without allocations and system calls, except
-`mmap` for blocks of 32 MB and more, as glibc does. Freed sampled runs up to 1 MB are cached (up to 8 MB); other runs
+`mmap` for blocks of 32 MiB and more, as glibc does. Freed sampled runs up to 1 MiB are cached (up to 8 MiB); other runs
 are returned to the OS with `madvise` outside of the mutex. `calloc` zeroes memory outside of the mutex too. The
 duration of slow operations including waiting for the mutex is exported in
 `tgbotapi_memory_sampler_operation_seconds`.
@@ -203,7 +204,7 @@ duration of slow operations including waiting for the mutex is exported in
 **A/B test: `latency_ab.py`.** A server with memory accounting and a baseline server built with
 `-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF` run at the same time and get the same load: 2000 requests per second over 64
 connections (`getMe` and `getWebhookInfo` answered by Bot API, `getChatMember` and `getFile` answered by TDLib, and
-requests with 100 KB bodies) and probes sent by a fixed schedule: `getMe` every 2 ms and `getChatMember` every 5 ms.
+requests with 100000-byte bodies) and probes sent by a fixed schedule: `getMe` every 2 ms and `getChatMember` every 5 ms.
 A probe latency is measured from its scheduled time, so a stall of a server delays all probes scheduled during the
 stall and can't be hidden. A pause of the whole machine delays both servers at the same time, so the paired
 comparison of rounds cancels it out; a probe stalled while probes of the other server weren't is an own stall of the
@@ -211,7 +212,7 @@ server.
 
 ```
 python3 test/verify/latency_ab.py --build=<build dir> --config=baseline=<baseline build dir>/telegram-bot-api \
-    --config=accounting=<build dir>/telegram-bot-api --rounds=40 --duration=10 --json=latency.json
+    --config=accounting=<build dir>/telegram-bot-api --rounds=40 --duration-seconds=10 --json=latency.json
 python3 test/verify/latency_ab.py --analyze=latency.json   # report saved results again
 ```
 

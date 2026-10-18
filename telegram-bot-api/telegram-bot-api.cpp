@@ -255,32 +255,32 @@ int main(int argc, char *argv[]) {
                              "default value of the maximum webhook connections per bot",
                              td::OptionParser::parse_integer(parameters->default_max_webhook_connections_));
   options.add_checked_option(
-      '\0', "message-unload-delay",
+      '\0', "message-unload-delay-seconds",
       "delay in seconds after which messages are unloaded from TDLib memory if they aren't used; "
       "must be between 60 and 86400 (defaults to the TDLib default of 1800 for bots)",
       td::OptionParser::parse_integer(parameters->message_unload_delay_));
-  options.add_checked_option('\0', "tdlib-restart-interval",
+  options.add_checked_option('\0', "tdlib-restart-interval-seconds",
                              "gracefully restart TDLib instance of each bot after the specified number of seconds of "
                              "its work plus a random delay of up to 10% to release all memory used by it; requests "
                              "received during a restart are delayed until its end (disabled by default)",
                              td::OptionParser::parse_integer(tdlib_restart_interval));
-  options.add_checked_option('\0', "tdlib-restart-memory-limit",
+  options.add_checked_option('\0', "tdlib-restart-memory-limit-mib",
                              "gracefully restart TDLib instances one by one, starting with the instance using the most "
-                             "memory, while resident memory of the server exceeds the specified number of megabytes; "
-                             "checked every 5 seconds (disabled by default)",
+                             "memory, while resident memory of the server exceeds the specified number of MiB "
+                             "(1 MiB = 1048576 bytes); checked every 5 seconds (disabled by default)",
                              td::OptionParser::parse_integer(tdlib_restart_memory_limit));
-  options.add_checked_option('\0', "tdlib-restart-bot-memory-limit",
+  options.add_checked_option('\0', "tdlib-restart-bot-memory-limit-mib",
                              "gracefully restart TDLib instance of a bot, which uses more than the specified number of "
-                             "megabytes of memory together with its Bot API cache, excluding pending updates; checked "
+                             "MiB of memory together with its Bot API cache, excluding pending updates; checked "
                              "every 5 seconds; requires memory accounting (disabled by default)",
                              td::OptionParser::parse_integer(tdlib_restart_bot_memory_limit));
-  options.add_checked_option('\0', "tdlib-restart-min-uptime",
+  options.add_checked_option('\0', "tdlib-restart-min-uptime-seconds",
                              PSLICE() << "minimum uptime in seconds of a TDLib instance before it can be restarted "
                                          "because of a memory limit (default is "
                                       << tdlib_restart_min_uptime << ")",
                              td::OptionParser::parse_integer(tdlib_restart_min_uptime));
   options.add_checked_option(
-      '\0', "tdlib-restart-drain-timeout",
+      '\0', "tdlib-restart-drain-timeout-seconds",
       PSLICE() << "maximum time in seconds to wait for completion of active requests of a bot before its TDLib "
                   "instance is closed for a restart; the restart is cancelled if the time is exceeded and an automatic "
                   "restart is retried after 5 minutes or more; must be between 1 and 3600 (default is "
@@ -290,21 +290,22 @@ int main(int argc, char *argv[]) {
                      "return free memory to the OS using malloc_trim 10 seconds after the last restart of a TDLib "
                      "instance; works only with the glibc memory allocator",
                      [&] { parameters->malloc_trim_ = true; });
-  options.add_checked_option('\0', "tdlib-restart-cooldown",
+  options.add_checked_option('\0', "tdlib-restart-cooldown-seconds",
                              PSLICE() << "minimum delay in seconds between starts of restarts of TDLib instances, "
                                          "including requested ones (default is "
                                       << tdlib_restart_cooldown << ")",
                              td::OptionParser::parse_integer(tdlib_restart_cooldown));
-  options.add_checked_option('\0', "cpu-sampling-rate",
+  options.add_checked_option('\0', "cpu-sampling-rate-hz",
                              PSLICE() << "number of samples per second of CPU time of each thread, which are used to "
                                          "estimate CPU time consumed by each bot; 0 disables the sampling (default is "
                                       << parameters->cpu_sampling_rate_ << ")",
                              td::OptionParser::parse_integer(parameters->cpu_sampling_rate_));
-  options.add_checked_option('\0', "memory-sampling-interval",
-                             PSLICE() << "mean number of kilobytes of allocated memory between samples, which are used "
-                                         "to estimate memory used by each bot; 0 disables the accounting (default is "
-                                      << memory_sampling_interval << ")",
-                             td::OptionParser::parse_integer(memory_sampling_interval));
+  options.add_checked_option(
+      '\0', "memory-sampling-interval-kib",
+      PSLICE() << "mean number of KiB (1 KiB = 1024 bytes) of allocated memory between samples, which are used "
+                  "to estimate memory used by each bot; 0 disables the accounting (default is "
+               << memory_sampling_interval << ")",
+      td::OptionParser::parse_integer(memory_sampling_interval));
   options.add_checked_option('\0', "http-ip-address",
                              "local IP address, HTTP connections to which will be accepted. By default, connections to "
                              "any local IPv4 address are accepted",
@@ -369,23 +370,23 @@ int main(int argc, char *argv[]) {
   options.add_check([&] {
     if (parameters->message_unload_delay_ != 0 &&
         (parameters->message_unload_delay_ < 60 || parameters->message_unload_delay_ > 86400)) {
-      return td::Status::Error("Message unload delay must be between 60 and 86400");
+      return td::Status::Error("Message unload delay must be between 60 and 86400 seconds");
     }
     if (tdlib_restart_interval < 0 || tdlib_restart_memory_limit < 0 || tdlib_restart_min_uptime < 0 ||
         tdlib_restart_cooldown < 0) {
       return td::Status::Error("Wrong TDLib restart parameters specified");
     }
     if (tdlib_restart_drain_timeout <= 0 || tdlib_restart_drain_timeout > 3600) {
-      return td::Status::Error("TDLib restart drain timeout must be between 1 and 3600");
+      return td::Status::Error("TDLib restart drain timeout must be between 1 and 3600 seconds");
     }
     if (tdlib_restart_memory_limit > (static_cast<td::int64>(1) << 40)) {
       return td::Status::Error("Too big TDLib restart memory limit specified");
     }
     if (parameters->cpu_sampling_rate_ < 0 || parameters->cpu_sampling_rate_ > 1000) {
-      return td::Status::Error("CPU sampling rate must be between 0 and 1000");
+      return td::Status::Error("CPU sampling rate must be between 0 and 1000 Hz");
     }
     if (memory_sampling_interval < 0 || memory_sampling_interval > (1 << 20)) {
-      return td::Status::Error("Memory sampling interval must be between 0 and 1048576 kilobytes");
+      return td::Status::Error("Memory sampling interval must be between 0 and 1048576 KiB");
     }
     if (tdlib_restart_bot_memory_limit < 0 || tdlib_restart_bot_memory_limit > (static_cast<td::int64>(1) << 30)) {
       return td::Status::Error("Wrong TDLib restart bot memory limit specified");

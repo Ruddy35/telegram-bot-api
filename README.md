@@ -110,16 +110,21 @@ and continue sending requests to the new server as usual.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--tdlib-restart-memory-limit=<MB>` | disabled | Restart the instance using the most memory while resident memory of the server exceeds the limit |
-| `--tdlib-restart-bot-memory-limit=<MB>` | disabled | Restart the instance of a bot, which uses more memory than the limit |
-| `--tdlib-restart-min-uptime=<seconds>` | 3600 | Minimum uptime of an instance before a restart because of a memory limit |
-| `--tdlib-restart-interval=<seconds>` | disabled | Restart each instance after the uptime |
-| `--tdlib-restart-drain-timeout=<seconds>` | 30 | Maximum time to wait for active requests of a bot before a restart is cancelled |
-| `--tdlib-restart-cooldown=<seconds>` | 10 | Minimum delay between starts of restarts |
+| `--tdlib-restart-memory-limit-mib=<MiB>` | disabled | Restart the instance using the most memory while resident memory of the server exceeds the limit |
+| `--tdlib-restart-bot-memory-limit-mib=<MiB>` | disabled | Restart the instance of a bot, which uses more memory than the limit |
+| `--tdlib-restart-min-uptime-seconds=<seconds>` | 3600 | Minimum uptime of an instance before a restart because of a memory limit |
+| `--tdlib-restart-interval-seconds=<seconds>` | disabled | Restart each instance after the uptime |
+| `--tdlib-restart-drain-timeout-seconds=<seconds>` | 30 | Maximum time to wait for active requests of a bot before a restart is cancelled |
+| `--tdlib-restart-cooldown-seconds=<seconds>` | 10 | Minimum delay between starts of restarts |
 | `--malloc-trim` | disabled | Return free memory to the OS after restarts; only for glibc |
-| `--message-unload-delay=<seconds>` | TDLib default | Delay after which unused messages are unloaded from memory of TDLib instances |
-| `--cpu-sampling-rate=<samples>` | 100 | Samples per second of CPU time of a thread; 0 disables CPU accounting |
-| `--memory-sampling-interval=<KB>` | 64 | Mean size of allocated memory between samples; 0 disables memory accounting |
+| `--message-unload-delay-seconds=<seconds>` | TDLib default | Delay after which unused messages are unloaded from memory of TDLib instances |
+| `--cpu-sampling-rate-hz=<Hz>` | 100 | Samples per second of CPU time of a thread; 0 disables CPU accounting |
+| `--memory-sampling-interval-kib=<KiB>` | 64 | Mean size of allocated memory between samples; 0 disables memory accounting |
+
+The name of every option with a quantity ends with its unit: `-seconds`, `-mib` (1 MiB = 1048576 bytes), `-kib`
+(1 KiB = 1024 bytes) or `-hz` (samples per second). The same holds for environment variables of the Docker image and
+for lines added to the statistics page; metrics have their units in their names too, for example, `_bytes` or
+`_seconds`. Options of the original server keep their names.
 
 `GET http://<stat address>:<stat port>/?restart=<bot_id>|all` requests a restart manually. The statistics port must be
 accessible only from the internal network.
@@ -143,7 +148,7 @@ cd telegram-bot-api
 docker build -t telegram-bot-api .
 docker run -d --name telegram-bot-api --stop-timeout 60 \
   -e TELEGRAM_API_ID=<api_id> -e TELEGRAM_API_HASH=<api_hash> -e TELEGRAM_LOCAL=true \
-  -e TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT=5500 -e TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT=1500 \
+  -e TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT_MIB=5500 -e TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT_MIB=1500 \
   -p 8081:8081 -p 127.0.0.1:8082:8082 -v telegram-bot-api:/var/lib/telegram-bot-api telegram-bot-api
 ```
 
@@ -159,8 +164,8 @@ services:
       TELEGRAM_API_ID: <api_id>
       TELEGRAM_API_HASH: <api_hash>
       TELEGRAM_LOCAL: "true"
-      TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT: 5500
-      TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT: 1500
+      TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT_MIB: 5500
+      TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT_MIB: 1500
     ports:
       - "8081:8081"
       - "127.0.0.1:8082:8082"

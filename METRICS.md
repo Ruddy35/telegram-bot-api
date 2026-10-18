@@ -173,7 +173,7 @@ run the watchdog, DNS resolving, webhook certificates and statistics.
 ## CPU accounting
 
 All bots work in shared threads, so the OS can't split their CPU time. Each thread has a timer, which interrupts the
-thread after every 10 milliseconds of its CPU time (`--cpu-sampling-rate`, 100 samples per second by default); the
+thread after every 10 milliseconds of its CPU time (`--cpu-sampling-rate-hz`, 100 samples per second by default); the
 signal handler only increments the number of samples of the current actor context. Once a second the samples are
 attributed to bots, whose actors use the contexts, so `tgbotapi_bot_cpu_seconds_total` lags behind by up to a second.
 Each sample represents 10 milliseconds, so the relative error is about `1 / sqrt(number of samples)`: 10% for one
@@ -185,7 +185,7 @@ bots in proportion to their requests, as shown below. The sum of CPU time of bot
 is equal to the sum of `tgbotapi_thread_cpu_seconds_total` with the accuracy of the sampling, except for CPU time of
 bots, which aren't authorized yet or were removed.
 
-CPU sampling uses `SIGPROF` and works only on Linux. Use `--cpu-sampling-rate=0` to disable it, for example, to use
+CPU sampling uses `SIGPROF` and works only on Linux. Use `--cpu-sampling-rate-hz=0` to disable it, for example, to use
 other profilers based on `SIGPROF`.
 
 ## Memory accounting
@@ -196,7 +196,7 @@ and
 
 1. count the total size of live allocations exactly: `tgbotapi_heap_bytes`;
 2. sample allocations: an allocation of `n` bytes is sampled with the probability `1 - exp(-(n + 16) / T)`, where `T` is
-   `--memory-sampling-interval` (64 KB by default), and is counted with the weight `size / probability` for the bot,
+   `--memory-sampling-interval-kib` (64 KiB by default), and is counted with the weight `size / probability` for the bot,
    in which actor context it was made. The sum of the weights of live sampled allocations is an unbiased estimate of
    memory of the bot.
 
@@ -211,10 +211,10 @@ allocations. [VERIFICATION.md](VERIFICATION.md) proves this and describes how to
 With the environment variable `TELEGRAM_BOT_API_MEMORY_AUDIT=1` memory of each bot is also counted exactly at the cost
 of a 16-byte header for every allocation; the mode is intended for verification of the estimates.
 
-The accounting works only on Linux with dynamically linked glibc. `--memory-sampling-interval=0` disables it, and
+The accounting works only on Linux with dynamically linked glibc. `--memory-sampling-interval-kib=0` disables it, and
 `-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF` builds the server without the wrappers. Almost every allocation takes only a few
 arithmetic operations without locks; once per `T` bytes of allocated memory on average a sampled allocation takes a
-lock for a few microseconds. The accounting uses about 1 MB of memory plus a cache of up to 8 MB of freed sampled
+lock for a few microseconds. The accounting uses about 1 MB of memory plus a cache of up to 8 MiB of freed sampled
 allocations. In the A/B test of [VERIFICATION.md](VERIFICATION.md#no-added-latency) it adds 0.9% of CPU time per
 request and no measurable latency.
 

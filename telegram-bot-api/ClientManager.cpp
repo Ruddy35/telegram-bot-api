@@ -669,11 +669,11 @@ void ClientManager::get_stats(td::Promise<td::BufferSlice> promise,
       sb << "tdlib_restart_count\t" << client_info->restart_count_ << '\n';
     }
     if (client_info->scheduled_restart_time_ > 0.0) {
-      sb << "tdlib_next_restart_in\t" << td::max(client_info->scheduled_restart_time_ - now, 0.0) << '\n';
+      sb << "tdlib_next_restart_in_seconds\t" << td::max(client_info->scheduled_restart_time_ - now, 0.0) << '\n';
     }
     if (client_info->restart_state_ != ClientInfo::RestartState::None) {
       sb << "tdlib_restart_state\t" << get_restart_state_name(client_info->restart_state_) << '\n';
-      sb << "tdlib_restart_duration\t" << now - client_info->restart_start_time_ << '\n';
+      sb << "tdlib_restart_duration_seconds\t" << now - client_info->restart_start_time_ << '\n';
       sb << "tdlib_restart_delayed_query_count\t" << client_info->restart_queries_.size() << '\n';
     }
 

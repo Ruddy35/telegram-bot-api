@@ -172,7 +172,7 @@ class MemoryAccuracyTest(unittest.TestCase):
     def test_observations(self):
         values = memory_metrics({1: (3e6, 2e6, 1e5), 2: (1e5, 1e5, 1e4)})
         observations, skipped, heap = verify_memory_accuracy.get_observations(values, 30)
-        # bot 2 has 100 KB, i.e. less than 30 expected samples of 64 KB
+        # bot 2 has 100 kB, i.e. less than 30 expected samples of 64 KiB
         self.assertEqual([o['bot'] for o in observations], ['1'])
         self.assertEqual(skipped, 1)
         self.assertIsNone(heap)
