@@ -38,12 +38,13 @@ std::atomic<td::uint64> WebhookActor::total_connection_count_{0};
 WebhookActor::WebhookActor(td::ActorShared<Callback> callback, td::int64 tqueue_id, td::HttpUrl url,
                            td::string cert_path, td::int32 max_connections, bool from_db_flag,
                            td::string cached_ip_address, bool fix_ip_address, td::string secret_token,
-                           std::shared_ptr<const ClientParameters> parameters)
+                           std::shared_ptr<const ClientParameters> parameters, std::shared_ptr<BotMetrics> metrics)
     : callback_(std::move(callback))
     , tqueue_id_(tqueue_id)
     , url_(std::move(url))
     , cert_path_(std::move(cert_path))
     , parameters_(std::move(parameters))
+    , metrics_(std::move(metrics))
     , fix_ip_address_(fix_ip_address)
     , from_db_flag_(from_db_flag)
     , max_connections_(max_connections)
@@ -335,7 +336,7 @@ void WebhookActor::loop() {
   if (!stop_flag_) {
     create_new_connections();
   }
-  if (!stop_flag_) {
+  if (!stop_flag_ && !is_paused_) {
     send_updates();
   }
   if (!stop_flag_) {
@@ -346,7 +347,53 @@ void WebhookActor::loop() {
   if (stop_flag_) {
     VLOG(webhook) << "Stop";
     stop();
+    return;
   }
+  check_paused();
+}
+
+void WebhookActor::pause(td::Promise<td::Unit> promise) {
+  VLOG(webhook) << "Pause";
+  if (pause_promise_) {
+    pause_promise_.set_error(td::Status::Error(500, "Webhook pause was requested again"));
+  }
+  is_paused_ = true;
+  pause_promise_ = std::move(promise);
+  check_paused();
+}
+
+void WebhookActor::resume() {
+  VLOG(webhook) << "Resume";
+  if (pause_promise_) {
+    pause_promise_.set_error(td::Status::Error(500, "Webhook was resumed"));
+  }
+  is_paused_ = false;
+  loop();
+}
+
+std::size_t WebhookActor::get_sending_update_count() const {
+  std::size_t result = 0;
+  for (auto id : connections_.ids()) {
+    auto *connection = connections_.get(id);
+    CHECK(connection != nullptr);
+    if (!connection->event_id_.empty()) {
+      result++;
+    }
+  }
+  return result;
+}
+
+void WebhookActor::check_paused() {
+  if (!is_paused_ || !pause_promise_) {
+    return;
+  }
+  auto sending_update_count = get_sending_update_count();
+  if (sending_update_count != 0) {
+    VLOG(webhook) << "Wait for " << sending_update_count << " updates being sent before pause";
+    return;
+  }
+  VLOG(webhook) << "Paused";
+  pause_promise_.set_value(td::Unit());
 }
 
 void WebhookActor::update() {
@@ -486,6 +533,7 @@ void WebhookActor::on_update_ok(td::TQueue::EventId event_id) {
 
   VLOG(webhook) << "Receive ok for update " << event_id << " in " << (last_success_time_ - it->second->last_send_time_)
                 << " seconds";
+  metrics_->on_webhook_result(BotMetrics::WebhookResult::Ok, last_success_time_ - it->second->last_send_time_);
 
   drop_event(event_id);
 }
@@ -498,6 +546,10 @@ void WebhookActor::on_update_error(td::TQueue::EventId event_id, td::Slice error
   CHECK(it != update_map_.end());
   CHECK(it->second != nullptr);
   auto &update = *it->second;
+  metrics_->on_webhook_result(td::begins_with(error, "Webhook connection closed")
+                                  ? BotMetrics::WebhookResult::ConnectionClosed
+                                  : BotMetrics::WebhookResult::HttpError,
+                              now - update.last_send_time_);
 
   const int MAX_RETRY_AFTER = 3600;
   retry_after = td::clamp(retry_after, 0, MAX_RETRY_AFTER);
@@ -510,6 +562,7 @@ void WebhookActor::on_update_error(td::TQueue::EventId event_id, td::Slice error
   }
   if (parameters_->shared_data_->get_unix_time(now) + next_effective_delay > update.expires_at_) {
     LOG(WARNING) << "Drop update " << event_id << ": " << error;
+    metrics_->on_webhook_update_dropped();
     drop_event(event_id);
     return;
   }

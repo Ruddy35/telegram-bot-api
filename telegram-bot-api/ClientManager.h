@@ -6,7 +6,10 @@
 //
 #pragma once
 
+#include "telegram-bot-api/BotMetrics.h"
 #include "telegram-bot-api/Client.h"
+#include "telegram-bot-api/CpuSampler.h"
+#include "telegram-bot-api/MetricsWriter.h"
 #include "telegram-bot-api/Query.h"
 #include "telegram-bot-api/Stats.h"
 #include "telegram-bot-api/Watchdog.h"
@@ -21,7 +24,10 @@
 #include "td/utils/Promise.h"
 #include "td/utils/Slice.h"
 
+#include <array>
+#include <map>
 #include <memory>
+#include <queue>
 #include <utility>
 
 namespace telegram_bot_api {
@@ -48,15 +54,56 @@ class ClientManager final : public td::Actor {
 
   void get_stats(td::Promise<td::BufferSlice> promise, td::vector<std::pair<td::string, td::string>> args);
 
+  // returns metrics in the Prometheus text exposition format
+  void get_metrics(td::Promise<td::BufferSlice> promise, td::vector<std::pair<td::string, td::string>> args);
+
+  // the HTTP client has closed connection before receiving an answer to the query
+  void on_query_abandoned(td::string token, td::string method);
+
   void close(td::Promise<td::Unit> &&promise);
 
  private:
   class ClientInfo {
    public:
+    ClientInfo() = default;
+    ClientInfo(BotStatActor &&stat, td::string token, td::int64 tqueue_id, td::string bot_token, bool is_test_dc,
+               double first_start_time)
+        : stat_(std::move(stat))
+        , token_(std::move(token))
+        , tqueue_id_(tqueue_id)
+        , bot_token_(std::move(bot_token))
+        , is_test_dc_(is_test_dc)
+        , first_start_time_(first_start_time)
+        , metrics_(std::make_shared<BotMetrics>()) {
+      stat_.set_metrics(metrics_);
+    }
+
     BotStatActor stat_;
     td::string token_;
-    td::int64 tqueue_id_;
+    td::int64 tqueue_id_ = 0;
     td::ActorOwn<Client> client_;
+
+    td::string bot_token_;
+    bool is_test_dc_ = false;
+    double first_start_time_ = 0.0;  // creation time of the first Client
+    double start_time_ = 0.0;        // creation time of the current Client
+
+    std::shared_ptr<BotMetrics> metrics_;
+    bool was_authorized_ = false;
+
+    // graceful restart of the TDLib instance
+    //  Pausing: getUpdates queries are delayed; the Client is in the state Pausing;
+    //  Draining: all queries are delayed; the Client is in the states Paused, Draining, GoingOffline or Offline;
+    //  Closing: all queries are delayed; the TDLib instance is being closed.
+    enum class RestartState : td::int8 { None, Pausing, Draining, Closing };
+    RestartState restart_state_ = RestartState::None;
+    std::queue<PromisedQueryPtr> restart_queries_;  // queries received during the restart
+    double restart_start_time_ = 0.0;
+    double scheduled_restart_time_ = 0.0;  // time of the next periodic restart; 0 if none
+    double restart_retry_time_ = 0.0;      // the restart can't be automatically retried before the time
+    td::int32 restart_count_ = 0;
+    td::int32 failed_restart_count_ = 0;
+    bool is_restart_requested_ = false;
   };
   td::Container<ClientInfo> clients_;
   BotStatActor stat_{td::ActorId<BotStatActor>()};
@@ -78,7 +125,65 @@ class ClientManager final : public td::Actor {
   td::int64 tqueue_deleted_events_ = 0;
   td::int64 last_tqueue_deleted_events_ = 0;
 
+  td::uint64 restarting_client_id_ = 0;
+  double next_restart_time_ = 0.0;  // cooldown of restarts
+  double next_memory_check_time_ = 0.0;
+  double malloc_trim_time_ = 0.0;
+  td::int64 total_restart_count_ = 0;
+  td::int64 total_failed_restart_count_ = 0;
+
+  td::uint64 periodic_task_count_ = 0;
+  static constexpr td::uint64 TDLIB_STATISTICS_PERIOD = 60;  // in PERIODIC_TASK_PERIOD
+
+  // metrics of queries, which weren't sent to a Client
+  enum class RejectReason : td::int8 {
+    Closing,
+    InvalidToken,
+    MisdirectedToken,
+    ClosedBot,
+    IpFloodLimit,
+    GlobalFloodLimit,
+    Size
+  };
+  std::array<td::int64, static_cast<std::size_t>(RejectReason::Size)> rejected_queries_{};
+  std::map<td::int32, td::int64> unauthorized_bot_requests_;  // HTTP status code -> count; for bots removed before
+                                                              // authorization
+
+  // statistical estimation of CPU time consumed by each bot; see CpuSampler
+  double cpu_sampling_period_ = 0.0;  // 0 if the sampling is disabled
+  td::vector<td::ActorOwn<CpuSampler>> cpu_samplers_;
+  td::int64 unattributed_cpu_samples_ = 0;
+  struct ThreadStats {
+    double cpu_time = 0.0;    // total CPU time consumed by the thread
+    td::int64 thread_id = 0;  // identifier of the thread in the OS
+    td::uint64 lag_counts[CpuSampler::LAG_BUCKET_COUNT] = {};
+    double lag_sum = 0.0;
+    std::array<double, 60> recent_max_lags{};  // maximum lags between the last 60 flushes of samples, done every second
+    std::size_t recent_max_lag_pos = 0;
+  };
+  td::vector<ThreadStats> threads_;  // scheduler identifier -> statistics of the thread
+
+  // implemented in ClientManagerMetrics.cpp
+  void start_cpu_sampling();
+
+  void on_cpu_samples(CpuSampler::Samples samples);
+
+  static void declare_metrics(MetricsWriter &writer);
+
+  // bot_memory and bot_exact_memory are total memory of the bots listed on the page
+  void add_server_metrics(MetricsWriter &writer, double now, td::int64 bot_memory, td::int64 bot_exact_memory);
+
+  void add_bot_metrics(MetricsWriter &writer, const ClientInfo &client_info, td::Slice bot_label, double now);
+
   static constexpr double WATCHDOG_TIMEOUT = 0.25;
+  static constexpr std::size_t MAX_RESTART_QUERIES = 10000;
+  static constexpr double PERIODIC_TASK_PERIOD = 1.0;
+  static constexpr double RESTART_MEMORY_CHECK_PERIOD = 5.0;
+  static constexpr double RESTART_RETRY_DELAY = 300.0;
+  // delayed queries are failed if a restart takes longer than the drain timeout plus this time, which is more than enough
+  // to disable network and to close and open the TDLib instance
+  static constexpr double MAX_RESTART_DURATION = 120.0;
+  static constexpr double MALLOC_TRIM_DELAY = 10.0;
 
   static td::int64 get_tqueue_id(td::int64 user_id, bool is_test_dc);
 
@@ -90,6 +195,36 @@ class ClientManager final : public td::Actor {
     td::vector<td::uint64> top_client_ids;
   };
   TopClients get_top_clients(std::size_t max_count, td::Slice token_filter);
+
+  void create_client_actor(td::uint64 id);
+
+  static td::string get_bot_label(const ClientInfo &client_info);
+
+  void schedule_periodic_tasks();
+
+  void run_periodic_tasks();
+
+  double get_scheduled_restart_time(double now) const;
+
+  td::int32 request_restart(td::Slice bot_id);
+
+  void check_restarts(double now);
+
+  void start_restart(td::uint64 id, td::Slice reason);
+
+  void on_restart_paused(td::uint64 id, td::Result<td::Unit> result);
+
+  void on_restart_closing(td::uint64 id, td::Result<td::Unit> result);
+
+  void cancel_restart(td::uint64 id, const td::Status &error);
+
+  void finish_restart(td::uint64 id);
+
+  void send_restart_queries(ClientInfo *client_info);
+
+  void fail_restart_queries(ClientInfo *client_info, QueryFailReason reason);
+
+  static td::Slice get_restart_state_name(ClientInfo::RestartState state);
 
   void start_up() final;
   void raw_event(const td::Event::Raw &event) final;

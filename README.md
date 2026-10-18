@@ -13,6 +13,7 @@ Please note that only global Bot API issues that affect all bots are suitable fo
 - [Documentation](#documentation)
 - [Moving a bot to a local server](#switching)
 - [Moving a bot from one local server to another](#moving)
+- [Changes of this fork](#fork)
 - [License](#license)
 
 <a name="installation"></a>
@@ -92,6 +93,102 @@ If you want to avoid losing updates between logging out on the old server and la
 [deleteWebhook](https://core.telegram.org/bots/api#deletewebhook), then use the method [close](https://core.telegram.org/bots/api#close) to close the bot instance.
 After the instance is closed, locate the bot's subdirectory in the working directory of the old server by the bot's user ID, move the subdirectory to the working directory of the new server
 and continue sending requests to the new server as usual.
+
+<a name="fork"></a>
+## Changes of this fork
+
+* **Graceful restarts of TDLib instances.** Memory of the TDLib instance of a bot grows with every user, chat and file
+  the bot has seen. The server can close and reopen the instance of a bot on the fly, which releases its memory, without
+  failing requests, losing or duplicating updates or affecting other bots. See [RESTARTS.md](RESTARTS.md).
+* **Metrics.** `GET http://<stat address>:<stat port>/metrics` returns metrics of every bot and of the server in the
+  Prometheus text format: requests, updates, webhook deliveries, files, CPU time, memory, disk usage, objects in memory
+  of TDLib instances and restarts. See [METRICS.md](METRICS.md).
+* **CPU and memory accounting by bots.** CPU time of each bot is estimated by sampling with `SIGPROF`; memory of each
+  bot is estimated by sampling of memory allocations with a reported standard deviation. See [METRICS.md](METRICS.md).
+* **Verification.** [VERIFICATION.md](VERIFICATION.md) lists the claims about the changes, how they are proven and
+  tested, and how to repeat the checks; `test/run_all.sh <build dir>` runs all tests.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--tdlib-restart-memory-limit-mib=<MiB>` | disabled | Restart the instance using the most memory while resident memory of the server exceeds the limit |
+| `--tdlib-restart-bot-memory-limit-mib=<MiB>` | disabled | Restart the instance of a bot, which uses more memory than the limit |
+| `--tdlib-restart-min-uptime-seconds=<seconds>` | 3600 | Minimum uptime of an instance before a restart because of a memory limit |
+| `--tdlib-restart-interval-seconds=<seconds>` | disabled | Restart each instance after the uptime |
+| `--tdlib-restart-drain-timeout-seconds=<seconds>` | 30 | Maximum time to wait for active requests of a bot before a restart is cancelled |
+| `--tdlib-restart-cooldown-seconds=<seconds>` | 10 | Minimum delay between starts of restarts |
+| `--malloc-trim` | disabled | Return free memory to the OS after restarts; only for glibc |
+| `--message-unload-delay-seconds=<seconds>` | TDLib default | Delay after which unused messages are unloaded from memory of TDLib instances |
+| `--cpu-sampling-rate-hz=<Hz>` | 100 | Samples per second of CPU time of a thread; 0 disables CPU accounting |
+| `--memory-sampling-interval-kib=<KiB>` | 64 | Mean size of allocated memory between samples; 0 disables memory accounting |
+
+The name of every option with a quantity ends with its unit: `-seconds`, `-mib` (1 MiB = 1048576 bytes), `-kib`
+(1 KiB = 1024 bytes) or `-hz` (samples per second). The same holds for environment variables of the Docker image and
+for lines added to the statistics page; metrics have their units in their names too, for example, `_bytes` or
+`_seconds`. Options of the original server keep their names.
+
+`GET http://<stat address>:<stat port>/?restart=<bot_id>|all` requests a restart manually. The statistics port must be
+accessible only from the internal network.
+
+Memory accounting replaces memory allocation functions and works only on Linux with dynamically linked glibc; build with
+`-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF` to keep the original functions. CPU accounting works only on Linux. Numbers of
+objects in memory of TDLib instances require a small patch of TDLib from [td-patches](td-patches/README.md), which is
+applied by CMake automatically, so `git` is needed for the build.
+
+### Docker
+
+The image is configured by environment variables: `TELEGRAM_<NAME>=<value>` becomes the option `--<name>=<value>`,
+where `<name>` is in lower case with `-` instead of `_`; the value `true` passes an option without a value, such as
+`--local`, and `false` or an empty value omits the option. `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are required; the
+server reads them itself, so the API hash doesn't appear in the command line. Arguments after the image name are passed
+after these options and override them.
+
+```
+git clone --recursive https://github.com/Ruddy35/telegram-bot-api.git
+cd telegram-bot-api
+docker build -t telegram-bot-api .
+docker run -d --name telegram-bot-api --stop-timeout 60 \
+  -e TELEGRAM_API_ID=<api_id> -e TELEGRAM_API_HASH=<api_hash> -e TELEGRAM_LOCAL=true \
+  -e TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT_MIB=5500 -e TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT_MIB=1500 \
+  -p 8081:8081 -p 127.0.0.1:8082:8082 -v telegram-bot-api:/var/lib/telegram-bot-api telegram-bot-api
+```
+
+The same with Docker Compose:
+
+```yaml
+services:
+  telegram-bot-api:
+    build: .
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      TELEGRAM_API_ID: <api_id>
+      TELEGRAM_API_HASH: <api_hash>
+      TELEGRAM_LOCAL: "true"
+      TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT_MIB: 5500
+      TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT_MIB: 1500
+    ports:
+      - "8081:8081"
+      - "127.0.0.1:8082:8082"
+    volumes:
+      - telegram-bot-api:/var/lib/telegram-bot-api
+volumes:
+  telegram-bot-api:
+```
+
+* The workflow `.github/workflows/docker.yml` builds the image on every push and publishes it to the GitHub Container
+  Registry for the branch `master` as `ghcr.io/ruddy35/telegram-bot-api:latest` and for tags `v*` with the tag name;
+  every published image is also tagged `sha-<commit>`. Use `image: ghcr.io/ruddy35/telegram-bot-api:latest` instead of
+  `build: .` to run the published image.
+* The image sets `TELEGRAM_DIR=/var/lib/telegram-bot-api`, `TELEGRAM_TEMP_DIR=/tmp/telegram-bot-api`,
+  `TELEGRAM_HTTP_PORT=8081` and `TELEGRAM_HTTP_STAT_PORT=8082`. Data of bots is kept in the volume.
+* The port 8082 serves statistics and `/metrics` and allows to restart TDLib instances and to change the verbosity
+  level, so publish it only to the internal network, for example, as `127.0.0.1:8082:8082`.
+* The server runs as the user `telegram-bot-api`, so a mounted host directory must be writable by it.
+* The server needs time to close TDLib instances on stop, hence `--stop-timeout 60` and `stop_grace_period: 60s`.
+* The log is written to the standard error stream, which `docker logs` shows. By default it contains only errors;
+  `TELEGRAM_VERBOSITY=2` adds warnings, including messages about restarts of TDLib instances.
+* Building of the image takes about 20 minutes on 4 cores and needs up to 3 GB of memory per compilation job;
+  `--build-arg BUILD_JOBS=2` decreases the number of jobs from 4.
 
 <a name="license"></a>
 ## License

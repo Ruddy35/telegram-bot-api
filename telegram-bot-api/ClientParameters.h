@@ -118,6 +118,25 @@ struct ClientParameters {
   td::int32 default_max_webhook_connections_ = 0;
   td::IPAddress webhook_proxy_ip_address_;
 
+  // value of the TDLib option "message_unload_delay" in seconds; 0 if the default value must be used
+  td::int32 message_unload_delay_ = 0;
+
+  // graceful restart of TDLib instances to release memory; times are in seconds, sizes are in bytes, 0 disables a limit
+  double tdlib_restart_interval_ = 0.0;           // restart TDLib instances after the uptime
+  td::int64 tdlib_restart_memory_limit_ = 0;      // restart TDLib instances while RSS exceeds the limit
+  td::int64 tdlib_restart_bot_memory_limit_ = 0;  // restart a TDLib instance using more memory; 0 if memory accounting
+                                                  // is disabled
+  double tdlib_restart_min_uptime_ = 3600.0;      // minimum TDLib instance uptime for a restart due to a memory limit
+  double tdlib_restart_drain_timeout_ = 30.0;  // maximum time to wait for active requests before closing for a restart
+  double tdlib_restart_cooldown_ = 10.0;       // minimum time between starts of restarts
+  bool malloc_trim_ = false;                   // call malloc_trim after restarts
+
+  // number of samples per second of CPU time of a thread used to estimate CPU time consumed by each bot; 0 if disabled
+  td::int32 cpu_sampling_rate_ = 100;
+
+  // mean number of allocated bytes between samples used to estimate memory used by each bot; 0 if disabled
+  td::int64 memory_sampling_interval_ = static_cast<td::int64>(64) << 10;
+
   double start_time_ = 0;
 
   td::ActorId<td::GetHostByNameActor> get_host_by_name_actor_id_;

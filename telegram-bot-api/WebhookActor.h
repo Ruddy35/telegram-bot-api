@@ -6,6 +6,7 @@
 //
 #pragma once
 
+#include "telegram-bot-api/BotMetrics.h"
 #include "telegram-bot-api/Query.h"
 
 #include "td/db/TQueue.h"
@@ -54,7 +55,8 @@ class WebhookActor final : public td::HttpOutboundConnection::Callback {
 
   WebhookActor(td::ActorShared<Callback> callback, td::int64 tqueue_id, td::HttpUrl url, td::string cert_path,
                td::int32 max_connections, bool from_db_flag, td::string cached_ip_address, bool fix_ip_address,
-               td::string secret_token, std::shared_ptr<const ClientParameters> parameters);
+               td::string secret_token, std::shared_ptr<const ClientParameters> parameters,
+               std::shared_ptr<BotMetrics> metrics);
   WebhookActor(const WebhookActor &) = delete;
   WebhookActor &operator=(const WebhookActor &) = delete;
   WebhookActor(WebhookActor &&) = delete;
@@ -64,6 +66,12 @@ class WebhookActor final : public td::HttpOutboundConnection::Callback {
   void update();
 
   void close();
+
+  // stops sending of new updates; the promise is resolved when there are no updates being sent
+  void pause(td::Promise<td::Unit> promise);
+
+  // continues sending of updates after pause
+  void resume();
 
   static td::int64 get_total_connection_count() {
     return total_connection_count_;
@@ -86,6 +94,7 @@ class WebhookActor final : public td::HttpOutboundConnection::Callback {
   td::string host_header_;
   const td::string cert_path_;
   std::shared_ptr<const ClientParameters> parameters_;
+  std::shared_ptr<BotMetrics> metrics_;
 
   double last_error_time_ = 0;
   td::string last_error_message_ = "<none>";
@@ -93,6 +102,9 @@ class WebhookActor final : public td::HttpOutboundConnection::Callback {
   const bool fix_ip_address_ = false;
 
   bool stop_flag_ = false;
+
+  bool is_paused_ = false;
+  td::Promise<td::Unit> pause_promise_;
 
   bool was_checked_ = false;
   const bool from_db_flag_ = false;
@@ -199,6 +211,8 @@ class WebhookActor final : public td::HttpOutboundConnection::Callback {
   void drop_event(td::TQueue::EventId event_id);
 
   void load_updates();
+  std::size_t get_sending_update_count() const;
+  void check_paused();
   void on_update_ok(td::TQueue::EventId event_id);
   void on_update_error(td::TQueue::EventId event_id, td::Slice error, int retry_after);
   td::Status send_update() TD_WARN_UNUSED_RESULT;

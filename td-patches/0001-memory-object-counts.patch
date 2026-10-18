@@ -1,0 +1,348 @@
+Patch of TDLib sources needed by the Bot API server metrics.
+
+- Adds the method getMemoryObjectCounts, which returns numbers of objects of different types stored in memory by
+  a TDLib instance, which are never deleted from memory, or are deleted only after some time.
+  The counts are calculated without iterating over the containers; the number of loaded messages is maintained by
+  MessagesManager in loaded_message_count_.
+- Allows bots to use getStorageStatisticsFast.
+
+The patch is applied automatically by CMake. See td-patches/README.md.
+
+diff --git a/td/generate/scheme/td_api.tl b/td/generate/scheme/td_api.tl
+index 1a23165..06402c4 100644
+--- a/td/generate/scheme/td_api.tl
++++ b/td/generate/scheme/td_api.tl
+@@ -9800,6 +9800,12 @@ storageStatistics size:int53 count:int32 by_chat:vector<storageStatisticsByChat>
+ //@log_size Size of the TDLib internal log
+ storageStatisticsFast files_size:int53 file_count:int32 database_size:int53 language_pack_database_size:int53 log_size:int53 = StorageStatisticsFast;
+ 
++//@description Contains the number of objects of a type, which are stored in memory @type Type of the objects @count Number of the objects
++memoryObjectCount type:string count:int53 = MemoryObjectCount;
++
++//@description Contains numbers of objects of different types, which are stored in memory @counts Numbers of objects
++memoryObjectCounts counts:vector<memoryObjectCount> = MemoryObjectCounts;
++
+ //@description Contains database statistics
+ //@statistics Database statistics in an unspecified human-readable format
+ databaseStatistics statistics:string = DatabaseStatistics;
+@@ -15783,6 +15789,9 @@ getStorageStatistics chat_limit:int32 = StorageStatistics;
+ //@description Quickly returns approximate storage usage statistics. Can be called before authorization
+ getStorageStatisticsFast = StorageStatisticsFast;
+ 
++//@description Returns numbers of objects of different types, which are stored in memory. The objects are never deleted from memory, or deleted only after some time
++getMemoryObjectCounts = MemoryObjectCounts;
++
+ //@description Returns database statistics
+ getDatabaseStatistics = DatabaseStatistics;
+ 
+diff --git a/td/telegram/AnimationsManager.h b/td/telegram/AnimationsManager.h
+index eea72ce..0db260d 100644
+--- a/td/telegram/AnimationsManager.h
++++ b/td/telegram/AnimationsManager.h
+@@ -27,6 +27,8 @@ namespace td {
+ class Td;
+ 
+ class AnimationsManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   AnimationsManager(Td *td, ActorShared<> parent);
+   AnimationsManager(const AnimationsManager &) = delete;
+diff --git a/td/telegram/AudiosManager.h b/td/telegram/AudiosManager.h
+index df7dd96..ced1eb6 100644
+--- a/td/telegram/AudiosManager.h
++++ b/td/telegram/AudiosManager.h
+@@ -21,6 +21,8 @@ namespace td {
+ class Td;
+ 
+ class AudiosManager {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   explicit AudiosManager(Td *td);
+   AudiosManager(const AudiosManager &) = delete;
+diff --git a/td/telegram/ChatManager.h b/td/telegram/ChatManager.h
+index d368239..d307738 100644
+--- a/td/telegram/ChatManager.h
++++ b/td/telegram/ChatManager.h
+@@ -64,6 +64,8 @@ struct MinChannel;
+ class Td;
+ 
+ class ChatManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   ChatManager(Td *td, ActorShared<> parent);
+   ChatManager(const ChatManager &) = delete;
+diff --git a/td/telegram/DocumentsManager.h b/td/telegram/DocumentsManager.h
+index 171ede4..6eda01b 100644
+--- a/td/telegram/DocumentsManager.h
++++ b/td/telegram/DocumentsManager.h
+@@ -31,6 +31,8 @@ class MultiPromiseActor;
+ class Td;
+ 
+ class DocumentsManager {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   explicit DocumentsManager(Td *td);
+   DocumentsManager(const DocumentsManager &) = delete;
+diff --git a/td/telegram/FileReferenceManager.h b/td/telegram/FileReferenceManager.h
+index 2779787..8b27fdc 100644
+--- a/td/telegram/FileReferenceManager.h
++++ b/td/telegram/FileReferenceManager.h
+@@ -44,6 +44,8 @@ class Td;
+ extern int VERBOSITY_NAME(file_references);
+ 
+ class FileReferenceManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   FileReferenceManager(Td *td, ActorShared<> parent);
+   FileReferenceManager(const FileReferenceManager &) = delete;
+diff --git a/td/telegram/MessagesManager.cpp b/td/telegram/MessagesManager.cpp
+index 0669e9c..fd3cc31 100644
+--- a/td/telegram/MessagesManager.cpp
++++ b/td/telegram/MessagesManager.cpp
+@@ -9070,6 +9070,7 @@ void MessagesManager::delete_all_dialog_messages(Dialog *d, bool remove_from_dia
+       d->deleted_message_ids.insert(m->message_id);
+     }
+   });
++  loaded_message_count_ -= static_cast<int64>(d->messages.calc_size());
+   Scheduler::instance()->destroy_on_scheduler(G()->get_gc_scheduler_id(), d->messages, d->ordered_messages);
+ 
+   if (was_live_location_deleted) {
+@@ -13654,6 +13655,7 @@ unique_ptr<MessagesManager::Message> MessagesManager::do_delete_message(Dialog *
+   auto result = std::move(d->messages[message_id]);
+   CHECK(m == result.get());
+   d->messages.erase(message_id);
++  loaded_message_count_--;
+ 
+   static_cast<ListNode *>(result.get())->remove();
+ 
+@@ -31581,6 +31583,7 @@ MessagesManager::Message *MessagesManager::add_message_to_dialog(Dialog *d, uniq
+ 
+   Message *result_message = message.get();
+   d->messages.set(message_id, std::move(message));
++  loaded_message_count_++;
+ 
+   d->message_lru_list.put_back(result_message);
+ 
+diff --git a/td/telegram/MessagesManager.h b/td/telegram/MessagesManager.h
+index 7c38534..06bcffb 100644
+--- a/td/telegram/MessagesManager.h
++++ b/td/telegram/MessagesManager.h
+@@ -132,6 +132,8 @@ class Td;
+ class Usernames;
+ 
+ class MessagesManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   static constexpr int32 SEND_MESSAGE_FLAG_DISABLE_WEB_PAGE_PREVIEW = 1 << 1;
+   static constexpr int32 SEND_MESSAGE_FLAG_HAS_REPLY_MARKUP = 1 << 2;
+@@ -3352,6 +3354,7 @@ class MessagesManager final : public Actor {
+   bool running_get_difference_ = false;  // true after before_get_difference and false after after_get_difference
+ 
+   WaitFreeHashMap<DialogId, unique_ptr<Dialog>, DialogIdHash> dialogs_;
++  int64 loaded_message_count_ = 0;  // total number of messages in Dialog::messages
+   int64 added_message_count_ = 0;
+ 
+   FlatHashSet<DialogId, DialogIdHash> loaded_dialogs_;  // dialogs loaded from database, but not added to dialogs_
+diff --git a/td/telegram/PollManager.h b/td/telegram/PollManager.h
+index c5d08d6..57d671a 100644
+--- a/td/telegram/PollManager.h
++++ b/td/telegram/PollManager.h
+@@ -45,6 +45,8 @@ class MessageContent;
+ class Td;
+ 
+ class PollManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   PollManager(Td *td, ActorShared<> parent);
+ 
+diff --git a/td/telegram/Requests.cpp b/td/telegram/Requests.cpp
+index 9a7b730..a151ba9 100644
+--- a/td/telegram/Requests.cpp
++++ b/td/telegram/Requests.cpp
+@@ -6,6 +6,11 @@
+ //
+ #include "td/telegram/Requests.h"
+ 
++#include "td/telegram/DocumentsManager.h"
++#include "td/telegram/FileReferenceManager.h"
++#include "td/telegram/VideoNotesManager.h"
++#include "td/telegram/VideosManager.h"
++#include "td/telegram/VoiceNotesManager.h"
+ #include "td/telegram/AccentColorId.h"
+ #include "td/telegram/AccountManager.h"
+ #include "td/telegram/AlarmManager.h"
+@@ -2979,7 +2984,6 @@ void Requests::on_request(uint64 id, const td_api::getStorageStatistics &request
+ }
+ 
+ void Requests::on_request(uint64 id, const td_api::getStorageStatisticsFast &request) {
+-  CHECK_IS_USER();
+   CREATE_REQUEST_PROMISE();
+   auto query_promise = PromiseCreator::lambda([promise = std::move(promise)](Result<FileStatsFast> result) mutable {
+     if (result.is_error()) {
+@@ -2991,6 +2995,42 @@ void Requests::on_request(uint64 id, const td_api::getStorageStatisticsFast &req
+   send_closure(td_->storage_manager_, &StorageManager::get_storage_stats_fast, std::move(query_promise));
+ }
+ 
++void Requests::on_request(uint64 id, const td_api::getMemoryObjectCounts &request) {
++  vector<td_api::object_ptr<td_api::memoryObjectCount>> counts;
++  auto add_count = [&counts](const char *type, size_t count) {
++    counts.push_back(td_api::make_object<td_api::memoryObjectCount>(type, static_cast<int64>(count)));
++  };
++  const auto *file_manager = td_->file_manager_.get();
++  add_count("file_id", file_manager->file_id_info_.size());
++  add_count("file_node", file_manager->file_nodes_.size());
++  add_count("remote_file_location", file_manager->remote_location_info_.size());
++  add_count("local_file_location", file_manager->local_location_to_file_id_.size());
++  add_count("file_source", td_->file_reference_manager_->file_sources_.size());
++  add_count("file_reference_node", td_->file_reference_manager_->nodes_.calc_size());
++  add_count("chat", td_->messages_manager_->dialogs_.calc_size());
++  add_count("message", static_cast<size_t>(td_->messages_manager_->loaded_message_count_));
++  add_count("message_file_source", td_->messages_manager_->message_full_id_to_file_source_id_.calc_size());
++  add_count("user", td_->user_manager_->users_.calc_size());
++  add_count("user_full_info", td_->user_manager_->users_full_.calc_size());
++  add_count("basic_group", td_->chat_manager_->chats_.calc_size());
++  add_count("basic_group_full_info", td_->chat_manager_->chats_full_.calc_size());
++  add_count("supergroup", td_->chat_manager_->channels_.calc_size());
++  add_count("min_supergroup", td_->chat_manager_->min_channels_.calc_size());
++  add_count("supergroup_full_info", td_->chat_manager_->channels_full_.calc_size());
++  add_count("animation", td_->animations_manager_->animations_.calc_size());
++  add_count("audio", td_->audios_manager_->audios_.calc_size());
++  add_count("document", td_->documents_manager_->documents_.calc_size());
++  add_count("sticker", td_->stickers_manager_->stickers_.calc_size());
++  add_count("sticker_set", td_->stickers_manager_->sticker_sets_.calc_size());
++  add_count("video", td_->videos_manager_->videos_.calc_size());
++  add_count("video_note", td_->video_notes_manager_->video_notes_.calc_size());
++  add_count("voice_note", td_->voice_notes_manager_->voice_notes_.calc_size());
++  add_count("web_page", td_->web_pages_manager_->web_pages_.calc_size());
++  add_count("poll", td_->poll_manager_->polls_.calc_size());
++  add_count("story", td_->story_manager_->stories_.calc_size());
++  send_closure(td_actor_, &Td::send_result, id, td_api::make_object<td_api::memoryObjectCounts>(std::move(counts)));
++}
++
+ void Requests::on_request(uint64 id, const td_api::getDatabaseStatistics &request) {
+   CREATE_REQUEST_PROMISE();
+   auto query_promise = PromiseCreator::lambda([promise = std::move(promise)](Result<DatabaseStats> result) mutable {
+diff --git a/td/telegram/Requests.h b/td/telegram/Requests.h
+index 1eee0b2..edb2992 100644
+--- a/td/telegram/Requests.h
++++ b/td/telegram/Requests.h
+@@ -368,6 +368,8 @@ class Requests {
+ 
+   void on_request(uint64 id, const td_api::getStorageStatisticsFast &request);
+ 
++  void on_request(uint64 id, const td_api::getMemoryObjectCounts &request);
++
+   void on_request(uint64 id, const td_api::getDatabaseStatistics &request);
+ 
+   void on_request(uint64 id, td_api::optimizeStorage &request);
+diff --git a/td/telegram/StickersManager.h b/td/telegram/StickersManager.h
+index 3b64317..fc457de 100644
+--- a/td/telegram/StickersManager.h
++++ b/td/telegram/StickersManager.h
+@@ -57,6 +57,8 @@ namespace td {
+ class Td;
+ 
+ class StickersManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   static constexpr int64 GREAT_MINDS_SET_ID = 1842540969984001;
+ 
+diff --git a/td/telegram/StoryManager.h b/td/telegram/StoryManager.h
+index 4be1e44..5a77d49 100644
+--- a/td/telegram/StoryManager.h
++++ b/td/telegram/StoryManager.h
+@@ -58,6 +58,8 @@ struct StoryDbStory;
+ class Td;
+ 
+ class StoryManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+   struct Story {
+     DialogId sender_dialog_id_;
+     int32 date_ = 0;
+diff --git a/td/telegram/UserManager.h b/td/telegram/UserManager.h
+index 67e62df..119ed38 100644
+--- a/td/telegram/UserManager.h
++++ b/td/telegram/UserManager.h
+@@ -78,6 +78,8 @@ class StarRating;
+ class Td;
+ 
+ class UserManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   UserManager(Td *td, ActorShared<> parent);
+   UserManager(const UserManager &) = delete;
+diff --git a/td/telegram/VideoNotesManager.h b/td/telegram/VideoNotesManager.h
+index 9ee0df4..8d4740a 100644
+--- a/td/telegram/VideoNotesManager.h
++++ b/td/telegram/VideoNotesManager.h
+@@ -25,6 +25,8 @@ namespace td {
+ class Td;
+ 
+ class VideoNotesManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   VideoNotesManager(Td *td, ActorShared<> parent);
+   VideoNotesManager(const VideoNotesManager &) = delete;
+diff --git a/td/telegram/VideosManager.h b/td/telegram/VideosManager.h
+index 3bae8da..7bc3bb8 100644
+--- a/td/telegram/VideosManager.h
++++ b/td/telegram/VideosManager.h
+@@ -24,6 +24,8 @@ namespace td {
+ class Td;
+ 
+ class VideosManager {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   explicit VideosManager(Td *td);
+   VideosManager(const VideosManager &) = delete;
+diff --git a/td/telegram/VoiceNotesManager.h b/td/telegram/VoiceNotesManager.h
+index 9e974c4..6d30d45 100644
+--- a/td/telegram/VoiceNotesManager.h
++++ b/td/telegram/VoiceNotesManager.h
+@@ -22,6 +22,8 @@ namespace td {
+ class Td;
+ 
+ class VoiceNotesManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   VoiceNotesManager(Td *td, ActorShared<> parent);
+   VoiceNotesManager(const VoiceNotesManager &) = delete;
+diff --git a/td/telegram/WebPagesManager.h b/td/telegram/WebPagesManager.h
+index e7f31de..54fcf40 100644
+--- a/td/telegram/WebPagesManager.h
++++ b/td/telegram/WebPagesManager.h
+@@ -40,6 +40,8 @@ struct BinlogEvent;
+ class Td;
+ 
+ class WebPagesManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   WebPagesManager(Td *td, ActorShared<> parent);
+ 
+diff --git a/td/telegram/files/FileManager.h b/td/telegram/files/FileManager.h
+index ebaf2cc..86d410b 100644
+--- a/td/telegram/files/FileManager.h
++++ b/td/telegram/files/FileManager.h
+@@ -395,6 +395,8 @@ class FileView {
+ };
+ 
+ class FileManager final : public Actor {
++  friend class Requests;  // for getMemoryObjectCounts
++
+  public:
+   class DownloadCallback {
+    public:

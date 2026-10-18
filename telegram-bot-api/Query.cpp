@@ -117,8 +117,11 @@ void Query::set_error(int http_status_code, td::BufferSlice result) {
   send_response_stat();
 }
 
-void Query::set_retry_after_error(int retry_after) {
+void Query::set_retry_after_error(int retry_after, QueryFailReason fail_reason) {
   retry_after_ = retry_after;
+  if (fail_reason != QueryFailReason::None) {
+    fail_reason_ = fail_reason;
+  }
 
   td::FlatHashMap<td::string, td::unique_ptr<td::VirtuallyJsonable>> parameters;
   parameters.emplace("retry_after", td::make_unique<td::VirtuallyJsonableLong>(retry_after));
@@ -174,8 +177,13 @@ void Query::send_response_stat() const {
   if (stat_actor_.empty()) {
     return;
   }
-  send_closure(stat_actor_, &BotStatActor::add_event<ServerBotStat::Response>,
-               ServerBotStat::Response{state_ == State::OK, answer_.size(), file_count(), files_size()}, now);
+  ServerBotStat::Response response{state_ == State::OK, answer_.size(), file_count(), files_size()};
+  response.method_id_ = stat_method_id_;
+  response.http_status_code_ = http_status_code_;
+  response.fail_reason_ = fail_reason_;
+  response.duration_ = now - start_timestamp_;
+  response.query_size_ = query_size();
+  send_closure(stat_actor_, &BotStatActor::add_event<ServerBotStat::Response>, response, now);
 }
 
 }  // namespace telegram_bot_api

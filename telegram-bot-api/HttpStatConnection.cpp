@@ -21,6 +21,11 @@ void HttpStatConnection::handle(td::unique_ptr<td::HttpQuery> http_query,
   auto promise = td::PromiseCreator::lambda([actor_id = actor_id(this)](td::Result<td::BufferSlice> result) {
     send_closure(actor_id, &HttpStatConnection::on_result, std::move(result));
   });
+  is_metrics_query_ = http_query->url_path_ == "/metrics";
+  if (is_metrics_query_) {
+    send_closure(client_manager_, &ClientManager::get_metrics, std::move(promise), http_query->get_args());
+    return;
+  }
   send_closure(client_manager_, &ClientManager::get_stats, std::move(promise), http_query->get_args());
 }
 
@@ -35,7 +40,8 @@ void HttpStatConnection::on_result(td::Result<td::BufferSlice> result) {
   td::HttpHeaderCreator hc;
   hc.init_status_line(200);
   hc.set_keep_alive();
-  hc.set_content_type("text/plain");
+  hc.set_content_type(is_metrics_query_ ? td::Slice("text/plain; version=0.0.4; charset=utf-8")
+                                        : td::Slice("text/plain"));
   hc.set_content_size(content.size());
 
   auto r_header = hc.finish();
