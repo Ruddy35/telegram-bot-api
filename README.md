@@ -175,6 +175,10 @@ volumes:
   telegram-bot-api:
 ```
 
+* The workflow `.github/workflows/docker.yml` builds the image on every push and publishes it to the GitHub Container
+  Registry for the branch `master` as `ghcr.io/ruddy35/telegram-bot-api:latest` and for tags `v*` with the tag name;
+  every published image is also tagged `sha-<commit>`. Use `image: ghcr.io/ruddy35/telegram-bot-api:latest` instead of
+  `build: .` to run the published image.
 * The image sets `TELEGRAM_DIR=/var/lib/telegram-bot-api`, `TELEGRAM_TEMP_DIR=/tmp/telegram-bot-api`,
   `TELEGRAM_HTTP_PORT=8081` and `TELEGRAM_HTTP_STAT_PORT=8082`. Data of bots is kept in the volume.
 * The port 8082 serves statistics and `/metrics` and allows to restart TDLib instances and to change the verbosity
