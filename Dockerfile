@@ -6,15 +6,14 @@
 
 FROM debian:bookworm-slim AS build
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates ccache cmake g++ git gperf libssl-dev make zlib1g-dev \
+  && apt-get install -y --no-install-recommends ca-certificates cmake g++ git gperf libssl-dev make zlib1g-dev \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 # compilation of TDLib needs up to 3 GB of memory per job; decrease the number of jobs if the build runs out of memory
 ARG BUILD_JOBS=4
-RUN --mount=type=cache,target=/root/.ccache \
-  test -f td/CMakeLists.txt || { echo "td is empty: run git submodule update --init"; exit 1; } \
-  && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+RUN test -f td/CMakeLists.txt || { echo "td is empty: run git submodule update --init"; exit 1; } \
+  && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   && cmake --build build --target telegram-bot-api -j "$BUILD_JOBS"
 
 FROM debian:bookworm-slim
