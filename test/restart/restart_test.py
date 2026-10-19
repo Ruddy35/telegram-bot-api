@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -43,13 +44,14 @@ def log(*args):
 class TestServer(testlib.Server):
     """A server with test bots, which counts answered requests of the first bot and checks its exit code and log."""
 
-    def __init__(self, name, args=(), update_count=0, second_bot=False, extra_bots=(), expected_errors=()):
+    def __init__(self, name, args=(), update_count=0, second_bot=False, extra_bots=(), expected_errors=(),
+                 stat_token=testlib.STAT_TOKEN):
         self.name = name
         work = os.path.join(WORK_ROOT, name)
         shutil.rmtree(work, ignore_errors=True)
         bots = (testlib.BOTS if second_bot else testlib.BOTS[:1]) + list(extra_bots)
         testlib.prepare_work_dir(BUILD_DIR, work, bots, update_count)
-        super().__init__(os.path.join(BUILD_DIR, 'telegram-bot-api'), work, args)
+        super().__init__(os.path.join(BUILD_DIR, 'telegram-bot-api'), work, args, stat_token=stat_token)
         self.expected_errors = expected_errors
         self.calls = collections.Counter()  # answered requests of the first bot by (method, HTTP status code)
         self.lock = threading.Lock()
@@ -498,13 +500,54 @@ def scenario_options():
     os.makedirs(work, exist_ok=True)
     for option in ['--tdlib-restart-drain-timeout-seconds=0', '--tdlib-restart-drain-timeout-seconds=3601',
                    '--tdlib-restart-interval-seconds=-1', '--tdlib-restart-memory-limit-mib=-1',
-                   '--tdlib-restart-bot-memory-limit-mib=-1', '--tdlib-restart-min-uptime-seconds=-1', '--tdlib-restart-cooldown-seconds=-1',
-                   '--cpu-sampling-rate-hz=-1', '--cpu-sampling-rate-hz=1001', '--memory-sampling-interval-kib=-1',
-                   '--memory-sampling-interval-kib=1048577', '--message-unload-delay-seconds=59']:
+                   '--tdlib-restart-bot-memory-limit-mib=-1', '--tdlib-restart-min-uptime-seconds=-1',
+                   '--tdlib-restart-cooldown-seconds=-1', '--cpu-sampling-rate-hz=-1', '--cpu-sampling-rate-hz=1001',
+                   '--memory-sampling-interval-kib=-1', '--memory-sampling-interval-kib=1048577',
+                   '--message-unload-delay-seconds=59', '--http-stat-token=short-token-15c']:
         result = subprocess.run([os.path.join(BUILD_DIR, 'telegram-bot-api'), '--api-id=1', '--api-hash=test', '--local',
                                  '-p', str(testlib.free_port()), '-s', str(testlib.free_port()), '-d', work, option],
                                 capture_output=True, timeout=30)
         assert result.returncode != 0, option
+
+
+def scenario_stat_access():
+    """The statistics port requires the access token in the header "Authorization: Bearer <token>" for all pages and
+    actions; without a configured token all requests are denied."""
+    paths = ['', 'metrics', 'metrics?bot=%d' % BOT_ID, '?id=%d' % BOT_ID, '?restart=all', '?v=5']
+
+    def check_denied(server, token, status):
+        for path in paths:
+            code, headers, text = server.stat_request(path, token=token)
+            assert code == status, (path, token, code, text)
+            assert TOKEN not in text and str(BOT_ID) not in text, text
+            if status == 401:
+                assert headers['WWW-Authenticate'] == 'Bearer', headers
+        assert server.api('getMe')[0]['ok']  # the bot works, and nothing was restarted or logged more verbosely
+        time.sleep(1)
+        lines = server.log_lines()
+        assert not [line for line in lines if 'restart' in line.lower() and 'TDLib' in line], 'restart was requested'
+        assert not [line for line in lines if line.startswith(('[ 4]', '[ 5]'))], 'verbosity was changed'
+
+    with TestServer('stat_access_disabled', stat_token='') as server:
+        check_denied(server, None, 403)
+        check_denied(server, testlib.STAT_TOKEN, 403)
+        assert any('access token isn\'t set' in line for line in server.log_lines())
+
+    with TestServer('stat_access') as server:
+        for token in ['', testlib.STAT_TOKEN[:-1] + 'x', testlib.STAT_TOKEN + 'x', testlib.STAT_TOKEN[:-1]]:
+            check_denied(server, token, 401)
+        code, _, _ = server.stat_request('', token=None)
+        assert code == 200
+        # other authorization schemes are rejected
+        request = urllib.request.Request('http://127.0.0.1:%d/metrics' % server.stat_port,
+                                         headers={'Authorization': 'Basic ' + testlib.STAT_TOKEN})
+        try:
+            urllib.request.urlopen(request, timeout=10)
+            raise AssertionError('Basic authorization was accepted')
+        except urllib.error.HTTPError as e:
+            assert e.code == 401, e.code
+        assert server.stats()['bot_count'] == '1'
+        assert ('tgbotapi_bots', frozenset({('state', 'authorized')})) in server.metrics()
 
 
 def upload(server, method, field, content, http_timeout, **params):
@@ -782,7 +825,7 @@ def scenario_memory():
 
 SCENARIOS = ['webhook', 'polling', 'polling_pending', 'drain_timeout', 'cancel_with_getupdates', 'webhook_change',
              'close_during_restart', 'shutdown_during_restart', 'restart_all', 'policy', 'policy_limits',
-             'malloc_trim', 'options', 'metrics', 'metrics_disabled', 'resources', 'memory']
+             'malloc_trim', 'options', 'stat_access', 'metrics', 'metrics_disabled', 'resources', 'memory']
 
 
 def main():

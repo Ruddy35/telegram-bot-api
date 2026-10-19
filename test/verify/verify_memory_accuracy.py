@@ -19,6 +19,9 @@ different bots are independent, so if the reported error is right, z are approxi
  - z of the estimate of the whole heap is within +-4 in every scrape.
 Consecutive scrapes of a bot are correlated, so in the watch mode n is the smallest number of bots in a scrape.
 
+In the watch mode the access token of the statistics port is taken from the environment variable
+TELEGRAM_HTTP_STAT_TOKEN.
+
 Exit code: 0 if all checks passed, 1 otherwise, 2 for invalid arguments.
 """
 import argparse
@@ -145,8 +148,10 @@ def watch(options):
     rows = []
     deadline = time.time() + options.duration_seconds
     scrape = 0
+    request = urllib.request.Request(
+        options.url, headers={'Authorization': 'Bearer ' + os.environ.get('TELEGRAM_HTTP_STAT_TOKEN', '')})
     while True:
-        with urllib.request.urlopen(options.url, timeout=30) as r:
+        with urllib.request.urlopen(request, timeout=30) as r:
             observations, skipped, heap = get_observations(testlib.parse_metrics(r.read().decode()),
                                                            options.min_samples)
         scrape += 1

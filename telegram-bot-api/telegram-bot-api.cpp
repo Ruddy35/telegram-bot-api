@@ -212,6 +212,13 @@ int main(int argc, char *argv[]) {
     }
     return td::string();
   }(std::getenv("TELEGRAM_API_HASH"));
+  // the statistics port is accessible only with the token; it is read from the environment like the API hash
+  td::string http_stat_token = [](auto x) -> td::string {
+    if (x) {
+      return x;
+    }
+    return td::string();
+  }(std::getenv("TELEGRAM_HTTP_STAT_TOKEN"));
 
   options.set_usage(td::Slice(argv[0]), "--api-id=<arg> --api-hash=<arg> [--local] [OPTION]...");
   options.set_description("Telegram Bot API server");
@@ -232,6 +239,12 @@ int main(int argc, char *argv[]) {
                              td::OptionParser::parse_integer(http_port));
   options.add_checked_option('s', "http-stat-port", "HTTP statistics port",
                              td::OptionParser::parse_integer(http_stat_port));
+  options.add_option(
+      '\0', "http-stat-token",
+      "access token of the HTTP statistics port, which must be passed in the header \"Authorization: "
+      "Bearer <token>\"; at least 16 characters; all requests are denied if it is empty (defaults to the "
+      "value of the TELEGRAM_HTTP_STAT_TOKEN environment variable)",
+      td::OptionParser::parse_string(http_stat_token));
   options.add_option('d', "dir", "server working directory", td::OptionParser::parse_string(working_directory));
   options.add_option('f', "files-dir", "directory for storing auxiliary files (defaults to the working directory)",
                      td::OptionParser::parse_string(files_directory));
@@ -390,6 +403,9 @@ int main(int argc, char *argv[]) {
     }
     if (tdlib_restart_bot_memory_limit < 0 || tdlib_restart_bot_memory_limit > (static_cast<td::int64>(1) << 30)) {
       return td::Status::Error("Wrong TDLib restart bot memory limit specified");
+    }
+    if (!http_stat_token.empty() && http_stat_token.size() < 16) {
+      return td::Status::Error("HTTP statistics token must contain at least 16 characters");
     }
     return td::Status::OK();
   });
@@ -624,12 +640,15 @@ int main(int argc, char *argv[]) {
       .release();
 
   if (http_stat_port != 0) {
+    if (http_stat_token.empty()) {
+      LOG(WARNING) << "All requests to the HTTP statistics port are denied, because its access token isn't set";
+    }
     sched
         .create_actor_unsafe<HttpServer>(
             SharedData::get_client_scheduler_id(), "HttpStatsServer", http_stat_ip_address, http_stat_port,
-            [client_manager] {
+            [client_manager, http_stat_token] {
               return td::ActorOwn<td::HttpInboundConnection::Callback>(
-                  td::create_actor<HttpStatConnection>("HttpStatConnection", client_manager));
+                  td::create_actor<HttpStatConnection>("HttpStatConnection", client_manager, http_stat_token));
             })
         .release();
   }

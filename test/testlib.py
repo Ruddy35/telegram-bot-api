@@ -22,6 +22,9 @@ BOT2_ID = 136817688  # @Channel_Bot
 TOKEN2 = '%d:AAGq7rGkXmpVZ3bNzE9tP1yLcW4sDfHjKlQ' % BOT2_ID
 BOTS = [(TOKEN, BOT_ID), (TOKEN2, BOT2_ID)]
 
+# access token of the statistics port of test servers
+STAT_TOKEN = 'test-statistics-access-token'
+
 _METRIC_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)$')
 _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"')
 
@@ -151,19 +154,22 @@ def http_request(port, token, method, params, http_timeout=60):
 
 
 class Server:
-    """A server process with offline test bots; use as a context manager to stop the server in any case."""
+    """A server process with offline test bots; use as a context manager to stop the server in any case. The statistics
+    port is accessible with stat_token, which is passed to the server in the environment."""
 
-    def __init__(self, binary, work, args=(), env=None, api_port=None, stat_port=None):
+    def __init__(self, binary, work, args=(), env=None, api_port=None, stat_port=None, stat_token=STAT_TOKEN):
         self.binary = binary
         self.work = work
         self.args = list(args)
         self.env = env
         self.api_port = api_port or free_port()
         self.stat_port = stat_port or free_port()
+        self.stat_token = stat_token
         self.proc = None
 
     def start(self):
         env = dict(os.environ)
+        env['TELEGRAM_HTTP_STAT_TOKEN'] = self.stat_token
         env.update(self.env or {})
         self.proc = subprocess.Popen(
             [self.binary, '--api-id=1', '--api-hash=test', '--local', '-p', str(self.api_port), '-s', str(self.stat_port),
@@ -175,7 +181,7 @@ class Server:
                 raise RuntimeError('server exited with code %d; see %s' % (self.proc.returncode,
                                                                            os.path.join(self.work, 'log.txt')))
             try:
-                self.stats()
+                self.stat_request('')
                 return self
             except OSError:
                 if time.time() > deadline:
@@ -208,16 +214,29 @@ class Server:
         """Calls an API method with the parameters; http_timeout is the time to wait for the answer."""
         return http_request(self.api_port, token, method, params, http_timeout)
 
+    def stat_request(self, path, token=None):
+        """Requests a page of the statistics port with the token, stat_token by default; returns (HTTP status code,
+        headers, text). Raises OSError if the server doesn't answer."""
+        token = self.stat_token if token is None else token
+        request = urllib.request.Request('http://127.0.0.1:%d/%s' % (self.stat_port, path),
+                                         headers={'Authorization': 'Bearer ' + token} if token else {})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as r:
+                return r.status, r.headers, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read().decode()
+
     def metrics(self, query=''):
         """Returns parsed metrics after checking the page with check_metrics_page."""
-        with urllib.request.urlopen('http://127.0.0.1:%d/metrics%s' % (self.stat_port, query), timeout=30) as r:
-            assert r.headers['Content-Type'] == 'text/plain; version=0.0.4; charset=utf-8', r.headers['Content-Type']
-            return check_metrics_page(r.read().decode())
+        status, headers, text = self.stat_request('metrics' + query)
+        assert status == 200, (status, text)
+        assert headers['Content-Type'] == 'text/plain; version=0.0.4; charset=utf-8', headers['Content-Type']
+        return check_metrics_page(text)
 
     def stats(self, query=''):
         """Returns the first value of each key of the text statistics page."""
-        with urllib.request.urlopen('http://127.0.0.1:%d/%s' % (self.stat_port, query), timeout=10) as r:
-            text = r.read().decode()
+        status, _, text = self.stat_request(query)
+        assert status == 200, (status, text)
         result = {}
         for line in text.splitlines():
             parts = line.split('\t')

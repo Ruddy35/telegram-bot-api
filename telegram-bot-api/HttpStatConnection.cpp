@@ -9,14 +9,42 @@
 #include "td/net/HttpHeaderCreator.h"
 
 #include "td/utils/common.h"
+#include "td/utils/misc.h"
 #include "td/utils/Promise.h"
 
 namespace telegram_bot_api {
+
+bool HttpStatConnection::is_authorized(const td::HttpQuery &http_query) const {
+  if (access_token_.empty()) {
+    return false;
+  }
+  td::Slice authorization = http_query.get_header("authorization");
+  td::Slice prefix("Bearer ");
+  if (!td::begins_with(authorization, prefix) || authorization.size() != prefix.size() + access_token_.size()) {
+    return false;
+  }
+  // the comparison takes the same time for all tokens of the right size
+  unsigned char difference = 0;
+  for (std::size_t i = 0; i < access_token_.size(); i++) {
+    difference |= static_cast<unsigned char>(authorization[prefix.size() + i] ^ access_token_[i]);
+  }
+  return difference == 0;
+}
 
 void HttpStatConnection::handle(td::unique_ptr<td::HttpQuery> http_query,
                                 td::ActorOwn<td::HttpInboundConnection> connection) {
   CHECK(connection_.empty());
   connection_ = std::move(connection);
+
+  if (!is_authorized(*http_query)) {
+    if (access_token_.empty()) {
+      return send_response(403, "text/plain",
+                           td::BufferSlice("Forbidden: access is disabled, because the access token isn't set"), false);
+    }
+    return send_response(401, "text/plain",
+                         td::BufferSlice("Unauthorized: the header \"Authorization: Bearer <token>\" is required"),
+                         true);
+  }
 
   auto promise = td::PromiseCreator::lambda([actor_id = actor_id(this)](td::Result<td::BufferSlice> result) {
     send_closure(actor_id, &HttpStatConnection::on_result, std::move(result));
@@ -35,13 +63,20 @@ void HttpStatConnection::on_result(td::Result<td::BufferSlice> result) {
                  td::Status::Error(500, "Internal Server Error: closing"));
     return;
   }
+  send_response(200,
+                is_metrics_query_ ? td::Slice("text/plain; version=0.0.4; charset=utf-8") : td::Slice("text/plain"),
+                result.move_as_ok(), false);
+}
 
-  auto content = result.move_as_ok();
+void HttpStatConnection::send_response(int http_status_code, td::Slice content_type, td::BufferSlice content,
+                                       bool need_authorization) {
   td::HttpHeaderCreator hc;
-  hc.init_status_line(200);
+  hc.init_status_line(http_status_code);
   hc.set_keep_alive();
-  hc.set_content_type(is_metrics_query_ ? td::Slice("text/plain; version=0.0.4; charset=utf-8")
-                                        : td::Slice("text/plain"));
+  if (need_authorization) {
+    hc.add_header("WWW-Authenticate", "Bearer");
+  }
+  hc.set_content_type(content_type);
   hc.set_content_size(content.size());
 
   auto r_header = hc.finish();

@@ -105,6 +105,8 @@ and continue sending requests to the new server as usual.
   of TDLib instances and restarts. See [METRICS.md](METRICS.md).
 * **CPU and memory accounting by bots.** CPU time of each bot is estimated by sampling with `SIGPROF`; memory of each
   bot is estimated by sampling of memory allocations with a reported standard deviation. See [METRICS.md](METRICS.md).
+* **Access token of the statistics port.** The statistics page and `/metrics` are accessible only with the token
+  `--http-stat-token`; without it all requests are denied. See [Security](#security).
 * **Verification.** [VERIFICATION.md](VERIFICATION.md) lists the claims about the changes, how they are proven and
   tested, and how to repeat the checks; `test/run_all.sh <build dir>` runs all tests.
 
@@ -120,26 +122,53 @@ and continue sending requests to the new server as usual.
 | `--message-unload-delay-seconds=<seconds>` | TDLib default | Delay after which unused messages are unloaded from memory of TDLib instances |
 | `--cpu-sampling-rate-hz=<Hz>` | 100 | Samples per second of CPU time of a thread; 0 disables CPU accounting |
 | `--memory-sampling-interval-kib=<KiB>` | 64 | Mean size of allocated memory between samples; 0 disables memory accounting |
+| `--http-stat-token=<token>` | `TELEGRAM_HTTP_STAT_TOKEN` or empty | Access token of the statistics port, at least 16 characters; all requests are denied if it is empty |
 
 The name of every option with a quantity ends with its unit: `-seconds`, `-mib` (1 MiB = 1048576 bytes), `-kib`
 (1 KiB = 1024 bytes) or `-hz` (samples per second). The same holds for environment variables of the Docker image and
 for lines added to the statistics page; metrics have their units in their names too, for example, `_bytes` or
 `_seconds`. Options of the original server keep their names.
 
-`GET http://<stat address>:<stat port>/?restart=<bot_id>|all` requests a restart manually. The statistics port must be
-accessible only from the internal network.
+`GET http://<stat address>:<stat port>/?restart=<bot_id>|all` requests a restart manually.
 
 Memory accounting replaces memory allocation functions and works only on Linux with dynamically linked glibc; build with
 `-DTELEGRAM_BOT_API_HEAP_SAMPLING=OFF` to keep the original functions. CPU accounting works only on Linux. Numbers of
 objects in memory of TDLib instances require a small patch of TDLib from [td-patches](td-patches/README.md), which is
 applied by CMake automatically, so `git` is needed for the build.
 
+<a name="security"></a>
+### Security
+
+Check every port and path that is opened to the internet: the server, its log and its data contain tokens of bots and
+other secrets, and an opened port or directory leaks them. Open only the API port and only through a TLS proxy.
+
+* **The statistics port** (`--http-stat-port`) must never be opened to the internet. The page `/` shows tokens of bots
+  and URLs of their webhooks, `/metrics` shows identifiers and usernames of bots and their load, `/?v=<level>` changes
+  the verbosity level of the log and `/?restart=` restarts TDLib instances. Every request must have the header
+  `Authorization: Bearer <token>` with the token `--http-stat-token` (environment variable `TELEGRAM_HTTP_STAT_TOKEN`).
+  The token is empty by default, so all requests are denied with 403 until it is set; generate it, for example, with
+  `openssl rand -hex 32`. Wrong or missing tokens are rejected with 401. The token is sent in plain text, so it doesn't
+  replace network isolation: publish the port only to the internal network, for example, to `127.0.0.1` or to the
+  network of Prometheus.
+* **The API port** (`--http-port`) accepts plain HTTP, so tokens of bots and contents of requests must reach it only
+  through a TLS termination proxy or the internal network. The server works with any valid bot token sent to it, and
+  in the local mode (`--local`) a request with any bot token, for example, of a just created bot, can send to Telegram
+  any file the server can read (`file://` URIs), receives absolute paths of files and can set a webhook to any local IP
+  address, so the server sends requests to the internal network. Don't open the API port of a server in the local mode
+  to the internet.
+* **The log** contains tokens: log lines of a bot have its token in the name of its actor; at the verbosity level 3
+  and higher requests and answers are logged with their contents, and on a crash the server writes the last 1 MiB of
+  messages of the level `--memory-verbosity` (3 by default) to the log. Store and ship the log as a secret.
+* **The working directory** (`--dir`) contains directories named by tokens of bots, databases of TDLib instances with
+  messages and files, and `webhooks_db.binlog` with webhook URLs and secret tokens. Never serve it or `--temp-dir` by
+  an HTTP server, and keep them readable only by the server.
+
 ### Docker
 
 The image is configured by environment variables: `TELEGRAM_<NAME>=<value>` becomes the option `--<name>=<value>`,
 where `<name>` is in lower case with `-` instead of `_`; the value `true` passes an option without a value, such as
 `--local`, and `false` or an empty value omits the option. `TELEGRAM_API_ID` and `TELEGRAM_API_HASH` are required; the
-server reads them itself, so the API hash doesn't appear in the command line. Arguments after the image name are passed
+server reads them and `TELEGRAM_HTTP_STAT_TOKEN` itself, so the secrets don't appear in the command line. Arguments after the image name are passed
 after these options and override them.
 
 ```
@@ -149,6 +178,7 @@ docker build -t telegram-bot-api .
 docker run -d --name telegram-bot-api --stop-timeout 60 \
   -e TELEGRAM_API_ID=<api_id> -e TELEGRAM_API_HASH=<api_hash> -e TELEGRAM_LOCAL=true \
   -e TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT_MIB=5500 -e TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT_MIB=1500 \
+  -e TELEGRAM_HTTP_STAT_TOKEN=<token> \
   -p 8081:8081 -p 127.0.0.1:8082:8082 -v telegram-bot-api:/var/lib/telegram-bot-api telegram-bot-api
 ```
 
@@ -166,6 +196,7 @@ services:
       TELEGRAM_LOCAL: "true"
       TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT_MIB: 5500
       TELEGRAM_TDLIB_RESTART_BOT_MEMORY_LIMIT_MIB: 1500
+      TELEGRAM_HTTP_STAT_TOKEN: <token>
     ports:
       - "8081:8081"
       - "127.0.0.1:8082:8082"
@@ -182,7 +213,11 @@ volumes:
 * The image sets `TELEGRAM_DIR=/var/lib/telegram-bot-api`, `TELEGRAM_TEMP_DIR=/tmp/telegram-bot-api`,
   `TELEGRAM_HTTP_PORT=8081` and `TELEGRAM_HTTP_STAT_PORT=8082`. Data of bots is kept in the volume.
 * The port 8082 serves statistics and `/metrics` and allows to restart TDLib instances and to change the verbosity
-  level, so publish it only to the internal network, for example, as `127.0.0.1:8082:8082`.
+  level, so publish it only to the internal network, for example, as `127.0.0.1:8082:8082`, and set
+  `TELEGRAM_HTTP_STAT_TOKEN`; without it all requests to the port are denied. For example,
+  `curl -H "Authorization: Bearer <token>" http://127.0.0.1:8082/metrics`. See [Security](#security).
+* Environment variables of a container, including the API hash and the token, are shown by `docker inspect` to
+  everyone who has access to the Docker daemon.
 * The server runs as the user `telegram-bot-api`, so a mounted host directory must be writable by it.
 * The server needs time to close TDLib instances on stop, hence `--stop-timeout 60` and `stop_grace_period: 60s`.
 * The log is written to the standard error stream, which `docker logs` shows. By default it contains only errors;

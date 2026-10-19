@@ -4,18 +4,23 @@ The server exports metrics of each bot and of the whole server in the Prometheus
 by Prometheus or VictoriaMetrics.
 
 ```
-curl http://127.0.0.1:<stat port>/metrics             # all bots and the server
-curl http://127.0.0.1:<stat port>/metrics?bot=<label>  # metrics of one bot only
+curl -H "Authorization: Bearer <token>" http://127.0.0.1:<stat port>/metrics             # all bots and the server
+curl -H "Authorization: Bearer <token>" http://127.0.0.1:<stat port>/metrics?bot=<label>  # metrics of one bot only
 ```
 
-The statistics port (`--http-stat-port`) must be accessible only from the internal network.
+`<token>` is the access token of the statistics port `--http-stat-token` (environment variable
+`TELEGRAM_HTTP_STAT_TOKEN`); while it isn't set, all requests to the port are denied. The statistics port
+(`--http-stat-port`) must be accessible only from the internal network; see the section "Security" in
+[README.md](README.md#security).
 
-Example of a scrape configuration:
+Example of a scrape configuration, where the file contains the token:
 
 ```yaml
 scrape_configs:
   - job_name: telegram-bot-api
     scrape_interval: 15s
+    authorization:
+      credentials_file: /etc/prometheus/telegram-bot-api-token
     static_configs:
       - targets: ['bot-api-host:<stat port>']
 ```

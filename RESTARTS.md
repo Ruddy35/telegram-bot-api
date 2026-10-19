@@ -92,11 +92,12 @@ restart, is restarted once in `--tdlib-restart-min-uptime-seconds` seconds; such
 ## Manual restarts and monitoring
 
 The statistics port (`--http-stat-port`) must be accessible only from the internal network; this is already required by
-the original server, because the port allows to change the verbosity level.
+the original server, because the port allows to change the verbosity level. Every request to the port must have the
+access token `--http-stat-token`; see the section "Security" in [README.md](README.md#security).
 
 ```
-curl 'http://127.0.0.1:<stat port>/?restart=<bot_id>'   # restart the instance of the bot
-curl 'http://127.0.0.1:<stat port>/?restart=all'        # restart all instances one by one
+curl -H "Authorization: Bearer <token>" 'http://127.0.0.1:<stat port>/?restart=<bot_id>'  # restart the instance of the bot
+curl -H "Authorization: Bearer <token>" 'http://127.0.0.1:<stat port>/?restart=all'       # restart all instances one by one
 ```
 
 `<bot_id>` is the part of the token before the colon. The answer contains `tdlib_restart_requested` with the number of

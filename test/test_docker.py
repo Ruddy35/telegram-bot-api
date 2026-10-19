@@ -49,8 +49,8 @@ def test_entrypoint(work):
     output = os.path.join(work, 'arguments')
     fake = os.path.join(fake_dir, 'telegram-bot-api')
     with open(fake, 'w') as f:
-        f.write('#!/bin/sh\nprintf "%%s\\0" "$@" > %s\nprintf "%%s" "$TELEGRAM_API_HASH" > %s.hash\n' %
-                (output, output))
+        f.write('#!/bin/sh\nprintf "%%s\\0" "$@" > %s\n'
+                'printf "%%s %%s" "$TELEGRAM_API_HASH" "$TELEGRAM_HTTP_STAT_TOKEN" > %s.secrets\n' % (output, output))
     os.chmod(fake, os.stat(fake).st_mode | stat.S_IEXEC)
 
     env = {
@@ -62,6 +62,7 @@ def test_entrypoint(work):
         'TELEGRAM_FILTER': 'a b=c',
         'TELEGRAM_API_ID': '12345',
         'TELEGRAM_API_HASH': 'secret-hash',
+        'TELEGRAM_HTTP_STAT_TOKEN': 'secret-statistics-token',
         'TELEGRAM_BOT_API_MEMORY_AUDIT': '1',
         'OTHER_VARIABLE': 'x',
     }
@@ -72,8 +73,8 @@ def test_entrypoint(work):
     expected_options = {'--http-port=8081', '--tdlib-restart-bot-memory-limit-mib=1500', '--local', '--filter=a b=c'}
     assert set(arguments[:-2]) == expected_options and len(arguments) == len(expected_options) + 2, arguments
     assert arguments[-2:] == ['--verbosity=3', 'an argument'], arguments
-    with open(output + '.hash') as f:
-        assert f.read() == 'secret-hash', 'the API hash must be passed in the environment'
+    with open(output + '.secrets') as f:
+        assert f.read() == 'secret-hash secret-statistics-token', 'the secrets must be passed in the environment'
     log('entrypoint: options', sorted(arguments[:-2]), 'arguments', arguments[-2:])
 
 
@@ -105,6 +106,7 @@ def server_env(work, api_port, stat_port):
         'TELEGRAM_DIR': work,
         'TELEGRAM_HTTP_PORT': str(api_port),
         'TELEGRAM_HTTP_STAT_PORT': str(stat_port),
+        'TELEGRAM_HTTP_STAT_TOKEN': testlib.STAT_TOKEN,
         'TELEGRAM_CPU_SAMPLING_RATE_HZ': '0',
         'TELEGRAM_TDLIB_RESTART_MEMORY_LIMIT_MIB': '100000',
     }
