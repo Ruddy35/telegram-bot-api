@@ -126,7 +126,7 @@ TELEGRAM_BOT_API_MEMORY_AUDIT=1 <build dir>/heap-sampler-test [test]...
 | `limits` | 65535 owners, a full table of contexts, 200000 context changes, 4200 threads |
 | `drift` | After 20 million operations and freeing of everything the estimate is exactly 0 and the exact counter has no drift |
 | `bias` | 200 independent heaps for each of 5 distributions of sizes: mean z = (estimate - exact) / σ within ±3/√200, standard deviation of z between 0.8 and 1.2, mean `V̂` within 10% of the theoretical variance, coverage of 1σ, 2σ, 3σ at least 58%, 90%, 98%; exact owner memory in the audit mode |
-| `accuracy` | The same with continuous allocation and freeing in 4 threads |
+| `accuracy` | Owners of 20 MB to 2 GB with 6 distributions of sizes under continuous allocation and freeing in 4 threads, frees in contexts of other owners and `realloc` growth: mean z over 30 snapshots within ±4/√(number of owners), which holds however correlated snapshots of an owner are, and exactly 0 after everything is freed. z of a heap of a few big blocks has heavy tails, because a missed block with a high probability of sampling gives z below -10, so the distribution of z is checked only by `bias` |
 | `overhead` | Cost of a pair of `malloc` and `free` with and without sampling |
 
 Results of `bias` with glibc:

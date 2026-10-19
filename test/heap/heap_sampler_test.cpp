@@ -419,10 +419,12 @@ void run_accuracy(const char *name, double interval, const std::vector<double> &
                 max_relative_error[i] * 100);
   }
   std::printf(" | z mean %+.2f stddev %.2f max %.1f\n", mean, stddev, max_abs);
-  // snapshots of the same heap are correlated, so the bounds are loose; the bias is checked precisely by test_bias
-  CHECK_TEST(std::fabs(mean) < 1.5, "%s: biased estimate, mean z %.2f", name, mean);
-  CHECK_TEST(stddev > 0.3 && stddev < 2.0, "%s: wrong variance, z stddev %.2f", name, stddev);
-  CHECK_TEST(max_abs < 6.0, "%s: too big error, max z %.1f", name, max_abs);
+  // Each z has the variance 1 and owners are sampled independently, so the mean of z over all snapshots has a standard
+  // deviation of at most 1 / sqrt(owners) however correlated snapshots of the same owner are. Only the mean is checked:
+  // z of a heap of a few big blocks has heavy tails, because missing a block with a high probability of sampling
+  // gives z below -10, so the distribution of z is checked by test_bias on independent heaps.
+  double max_mean = 4 / std::sqrt(static_cast<double>(owners.size()));
+  CHECK_TEST(std::fabs(mean) < max_mean, "%s: biased estimate, mean z %.2f", name, mean);
 
   for (auto &state : owners) {
     set_context(state->context);
